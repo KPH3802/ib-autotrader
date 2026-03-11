@@ -2,3 +2,6 @@ config.py
 trade_log.csv
 __pycache__/
 *.pyc
+*.pdf
+.DS_Store
+clientportal/
