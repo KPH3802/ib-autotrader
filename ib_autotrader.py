@@ -2,16 +2,19 @@
 """
 IB Auto-Trader — Equity Signal Execution Layer
 
-Reads tonight's signals from the 8-K and Form4 scanner databases,
-applies playbook rules (VIX kill switch, position sizing), and
+Reads tonight's signals from:
+  - 8-K scanner: Gmail IMAP (scanner DB lives on PythonAnywhere, not local)
+  - Form4 scanner: local SQLite DB
+
+Applies playbook rules (VIX kill switch, position sizing), and
 submits market orders via the IBKR Client Portal Web API.
 
 Signal sources:
-  - 8-K Item 1.01: SHORT signals with score >= 2
-  - Form4 Insider Buy Clusters: BUY signals
-  - Form4 Insider Sells (S1/S2): SHORT signals
+  - 8-K Item 1.01: SHORT signals with score >= 2 (from email)
+  - Form4 Insider Buy Clusters: BUY signals (from local DB)
+  - Form4 Insider Sells (S1/S2): SHORT signals (from local DB)
 
-Requires: IBKR Client Portal Gateway running on localhost:5000
+Requires: IBKR Client Portal Gateway running on localhost:5001
 
 Usage:
   python3 ib_autotrader.py                # Live execution
@@ -20,9 +23,12 @@ Usage:
 """
 
 import os
+import re
 import sys
 import csv
 import json
+import email
+import imaplib
 import sqlite3
 import logging
 import argparse
@@ -58,9 +64,12 @@ HALF_SIZE = config.HALF_POSITION_SIZE
 VIX_KILL = config.VIX_KILL_SWITCH
 MAX_ORDERS = config.MAX_POSITIONS_PER_RUN
 
-EIGHT_K_DB = SCRIPT_DIR / config.EIGHT_K_DB
 FORM4_DB = SCRIPT_DIR / config.FORM4_DB
 TRADE_LOG = SCRIPT_DIR / config.TRADE_LOG_PATH
+
+# Gmail IMAP settings (same credentials as outbound email)
+IMAP_SERVER = "imap.gmail.com"
+IMAP_PORT = 993
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,11 +86,11 @@ logger = logging.getLogger(__name__)
 def get_current_vix():
     """Fetch current VIX level via yfinance."""
     try:
+        import pandas
         vix = yf.Ticker("^VIX")
         hist = vix.history(period="1d")
         if not hist.empty:
-            # Handle MultiIndex columns
-            if isinstance(hist.columns, __import__('pandas').MultiIndex):
+            if isinstance(hist.columns, pandas.MultiIndex):
                 hist.columns = [c[0] for c in hist.columns]
             close = float(hist["Close"].iloc[-1])
             logger.info(f"VIX: {close:.2f}")
@@ -92,52 +101,145 @@ def get_current_vix():
 
 
 # ---------------------------------------------------------------------------
-# Signal queries
+# 8-K signals — parsed from Gmail IMAP
 # ---------------------------------------------------------------------------
 
-def query_8k_signals(today_str):
-    """Query 8-K database for tonight's SHORT signals (score >= 2)."""
-    signals = []
+def _connect_gmail():
+    """Open authenticated Gmail IMAP connection. Returns mail object or None."""
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+        mail.login(config.EMAIL_SENDER, config.EMAIL_PASSWORD)
+        return mail
+    except Exception as e:
+        logger.error(f"Gmail IMAP login failed: {e}")
+        return None
 
-    if not EIGHT_K_DB.exists():
-        logger.warning(f"8-K DB not found: {EIGHT_K_DB}")
+
+def _parse_8k_html(html):
+    """
+    Extract (ticker, score) pairs from 8-K scanner HTML email.
+
+    The emailer builds cards with:
+      <span style="font-size:22px;font-weight:bold">TICKER</span>
+      ...
+      <span style="...">Score N</span>
+
+    Only TRADE signals (score >= 2) appear in these cards.
+    """
+    signals = []
+    # Each card block contains one ticker then one score badge
+    # We match them in sequence across the HTML
+    pattern = r'font-size:22px;font-weight:bold">([\w.\-]+)</span>.*?Score\s+(\d+)'
+    matches = re.findall(pattern, html, re.DOTALL)
+
+    for ticker, score_str in matches:
+        score = int(score_str)
+        if score >= 2:
+            signals.append({
+                "source": "8K_1.01",
+                "ticker": ticker.upper(),
+                "direction": "SHORT",
+                "score": score,
+                "price": None,
+                "company": "",
+                "sector": "",
+                "detail": f"8-K Item 1.01, Score {score}",
+            })
+    return signals
+
+
+def query_8k_signals_from_email(today_str):
+    """
+    Search Gmail for today's 8-K scanner email and parse SHORT signals.
+
+    Looks for emails with subject starting with '8-K SHORT:' sent today.
+    Falls back to most recent 8-K SHORT email if none found for today.
+    """
+    signals = []
+    mail = _connect_gmail()
+    if not mail:
+        logger.warning("8-K signals unavailable — Gmail IMAP failed")
         return signals
 
     try:
-        conn = sqlite3.connect(str(EIGHT_K_DB))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        mail.select("INBOX")
 
-        cur.execute("""
-            SELECT ticker, company_name, signal_score, price_at_scan,
-                   sector, vix_at_scan, insider_sells_90d
-            FROM filings
-            WHERE passed_filters = 1
-              AND signal_score >= 2
-              AND scan_date = ?
-            ORDER BY signal_score DESC
-        """, (today_str,))
+        # Search for 8-K SHORT emails from today
+        # IMAP date format: DD-Mon-YYYY
+        dt = datetime.strptime(today_str, "%Y-%m-%d")
+        imap_date = dt.strftime("%d-%b-%Y")
 
-        for row in cur.fetchall():
-            if row["ticker"]:
-                signals.append({
-                    "source": "8K_1.01",
-                    "ticker": row["ticker"],
-                    "direction": "SHORT",
-                    "score": row["signal_score"],
-                    "price": row["price_at_scan"],
-                    "company": row["company_name"],
-                    "sector": row["sector"],
-                    "detail": f"Score {row['signal_score']}, insider sells: {row['insider_sells_90d']}",
-                })
+        # Try today's date first
+        typ, data = mail.search(None,
+            f'(SUBJECT "8-K SHORT:" SINCE "{imap_date}")')
 
-        conn.close()
+        msg_ids = data[0].split() if data[0] else []
+
+        # If nothing today, try most recent 8-K SHORT email (last 7 days)
+        if not msg_ids:
+            logger.info("No 8-K SHORT email today — checking last 7 days")
+            from datetime import timedelta
+            week_ago = (dt - timedelta(days=7)).strftime("%d-%b-%Y")
+            typ, data = mail.search(None,
+                f'(SUBJECT "8-K SHORT:" SINCE "{week_ago}")')
+            msg_ids = data[0].split() if data[0] else []
+
+        if not msg_ids:
+            logger.info("No 8-K SHORT emails found")
+            mail.logout()
+            return signals
+
+        # Take the most recent (last in list)
+        latest_id = msg_ids[-1]
+        typ, msg_data = mail.fetch(latest_id, "(RFC822)")
+
+        if not msg_data or not msg_data[0]:
+            logger.warning("Could not fetch 8-K email body")
+            mail.logout()
+            return signals
+
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+
+        # Log the email subject and date for confirmation
+        subj = msg.get("Subject", "")
+        sent = msg.get("Date", "")
+        logger.info(f"8-K email found: '{subj}' ({sent})")
+
+        # Extract HTML body
+        html_body = None
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/html":
+                    html_body = part.get_payload(decode=True).decode(
+                        part.get_content_charset() or "utf-8", errors="replace")
+                    break
+        elif msg.get_content_type() == "text/html":
+            html_body = msg.get_payload(decode=True).decode(
+                msg.get_content_charset() or "utf-8", errors="replace")
+
+        if not html_body:
+            logger.warning("No HTML body in 8-K email")
+            mail.logout()
+            return signals
+
+        signals = _parse_8k_html(html_body)
+        logger.info(f"8-K signals parsed from email: {len(signals)} SHORT")
+
     except Exception as e:
-        logger.error(f"8-K DB query failed: {e}")
+        logger.error(f"8-K email parse failed: {e}")
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
 
-    logger.info(f"8-K signals: {len(signals)} SHORT")
     return signals
 
+
+# ---------------------------------------------------------------------------
+# Form4 signals — read from local DB (DB lives in form4_scanner folder)
+# ---------------------------------------------------------------------------
 
 def query_form4_signals(today_str):
     """Query Form4 database for tonight's BUY and SHORT signals."""
@@ -167,7 +269,7 @@ def query_form4_signals(today_str):
                     "ticker": row["issuer_ticker"],
                     "direction": "BUY",
                     "score": 3,  # Clusters are high-conviction
-                    "price": None,  # Will fetch live
+                    "price": None,
                     "company": "",
                     "sector": "",
                     "detail": row["details"] or "Insider buy cluster",
@@ -188,7 +290,7 @@ def query_form4_signals(today_str):
                     "source": f"F4_SELL_{tier}",
                     "ticker": row["issuer_ticker"],
                     "direction": "SHORT",
-                    "score": 3 if tier == "S1" else 2,  # S1=full, S2=half
+                    "score": 3 if tier == "S1" else 2,
                     "price": None,
                     "company": "",
                     "sector": "",
@@ -196,6 +298,7 @@ def query_form4_signals(today_str):
                 })
 
         conn.close()
+
     except Exception as e:
         logger.error(f"Form4 DB query failed: {e}")
 
@@ -212,10 +315,11 @@ def query_form4_signals(today_str):
 def fetch_live_price(ticker):
     """Fetch current price via yfinance. Returns float or None."""
     try:
+        import pandas
         t = yf.Ticker(ticker)
         hist = t.history(period="1d")
         if not hist.empty:
-            if isinstance(hist.columns, __import__('pandas').MultiIndex):
+            if isinstance(hist.columns, pandas.MultiIndex):
                 hist.columns = [c[0] for c in hist.columns]
             return float(hist["Close"].iloc[-1])
     except Exception as e:
@@ -228,21 +332,17 @@ def fetch_live_price(ticker):
 # ---------------------------------------------------------------------------
 
 def calculate_shares(signal, live_price):
-    """Calculate number of shares based on playbook rules.
-
+    """
+    Calculate number of shares based on playbook rules.
     Score 2 = half size, Score 3+ = full size.
     """
     price = live_price or signal.get("price")
     if not price or price <= 0:
         return 0, 0.0
 
-    if signal["score"] >= 3:
-        size = FULL_SIZE
-    else:
-        size = HALF_SIZE
-
+    size = FULL_SIZE if signal["score"] >= 3 else HALF_SIZE
     shares = int(size / price)
-    return max(shares, 1), size  # At least 1 share
+    return max(shares, 1), size
 
 
 # ---------------------------------------------------------------------------
@@ -301,24 +401,21 @@ def search_contract(ticker):
     """Search for a stock contract ID (conid) by ticker symbol."""
     result = ib_request("GET", f"/iserver/secdef/search?symbol={ticker}")
     if result and isinstance(result, list) and len(result) > 0:
-        # Find US stock match
         for item in result:
             if item.get("conid"):
                 return int(item["conid"])
-            # Some results have sections
             sections = item.get("sections", [])
             for sec in sections:
                 if sec.get("secType") == "STK":
                     return int(item.get("conid", 0))
-        # Fallback to first result
         return int(result[0].get("conid", 0))
     logger.warning(f"No contract found for {ticker}")
     return None
 
 
 def place_order(account_id, conid, side, quantity):
-    """Place a market order via IB Client Portal API.
-
+    """
+    Place a market order via IB Client Portal API.
     Returns order ID or None.
     """
     payload = {
@@ -332,21 +429,18 @@ def place_order(account_id, conid, side, quantity):
     }
 
     result = ib_request("POST", f"/iserver/account/{account_id}/orders", payload)
-
     if not result:
         return None
 
     # Handle order confirmation prompts
     if isinstance(result, list) and len(result) > 0:
         item = result[0]
-        # Check if gateway wants confirmation
         if item.get("id") and item.get("message"):
             reply_id = item["id"]
             logger.info(f"  Confirming order: {item.get('message', [''])[0][:80]}")
             confirm = ib_request("POST", f"/iserver/reply/{reply_id}", {"confirmed": True})
             if confirm and isinstance(confirm, list) and len(confirm) > 0:
                 return confirm[0].get("order_id")
-        # Direct order response
         if item.get("order_id"):
             return item["order_id"]
 
@@ -406,7 +500,7 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False):
     lines.append(f"Mode: {mode}")
     lines.append(f"Date: {today_str}")
     lines.append(f"VIX: {vix:.2f}" if vix else "VIX: N/A")
-    lines.append(f"")
+    lines.append("")
 
     if signals_executed:
         lines.append(f"ORDERS PLACED ({len(signals_executed)}):")
@@ -472,7 +566,7 @@ def run(dry_run=False, verbose=False):
 
     # Step 2: Gather signals
     signals = []
-    signals.extend(query_8k_signals(today_str))
+    signals.extend(query_8k_signals_from_email(today_str))
     signals.extend(query_form4_signals(today_str))
 
     if not signals:
@@ -496,7 +590,6 @@ def run(dry_run=False, verbose=False):
     if not dry_run:
         if not check_ib_connection():
             logger.error("Cannot connect to IB Gateway. Aborting.")
-            # Log all signals as skipped
             for s in signals:
                 s["skip_reason"] = "IB Gateway offline"
             send_summary_email([], signals, vix, dry_run)
