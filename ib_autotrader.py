@@ -309,6 +309,42 @@ def query_form4_signals(today_str):
 
 
 # ---------------------------------------------------------------------------
+# M&A risk check
+# ---------------------------------------------------------------------------
+
+MA_KEYWORDS = [
+    "acqui", "merger", "buyout", "takeover", "tender offer",
+    "going private", "going-private", "purchased by", "acquired by",
+    "to be acquired", "definitive agreement", "acquisition agreement",
+]
+
+def check_ma_risk(ticker):
+    """
+    Check if ticker has recent M&A news that would invalidate a short signal.
+    Scans the last 10 yfinance news headlines for M&A keywords.
+    Returns (is_risky: bool, reason: str or None).
+    """
+    try:
+        t = yf.Ticker(ticker)
+        news = t.news
+        if not news:
+            return False, None
+        for item in news[:10]:
+            title = item.get("title", "").lower()
+            summary = item.get("summary", "").lower()
+            text = title + " " + summary
+            for kw in MA_KEYWORDS:
+                if kw in text:
+                    headline = item.get("title", "")[:80]
+                    reason = f"M&A keyword '{kw}' found — {headline}"
+                    return True, reason
+        return False, None
+    except Exception as e:
+        logger.warning(f"M&A check failed for {ticker}: {e}")
+        return False, None  # Don't block trade on check failure
+
+
+# ---------------------------------------------------------------------------
 # Price lookup
 # ---------------------------------------------------------------------------
 
@@ -614,6 +650,15 @@ def run(dry_run=False, verbose=False):
         if order_count >= MAX_ORDERS:
             signal["skip_reason"] = f"Max orders ({MAX_ORDERS}) reached"
             skipped.append(signal)
+            continue
+
+        # M&A check — skip if acquisition/merger news detected
+        ma_risk, ma_reason = check_ma_risk(ticker)
+        if ma_risk:
+            signal["skip_reason"] = f"M&A risk: {ma_reason}"
+            skipped.append(signal)
+            log_trade(signal, 0, 0, "SKIP_MA_RISK", vix=vix)
+            logger.warning(f"  SKIPPED {ticker}: {signal['skip_reason']}")
             continue
 
         # Fetch live price
