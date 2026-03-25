@@ -5,6 +5,7 @@ IB Auto-Trader — Equity Signal Execution Layer
 Reads tonight's signals from:
   - 8-K scanner: Gmail IMAP (scanner DB lives on PythonAnywhere, not local)
   - Form4 scanner: local SQLite DB
+  - Dividend Cut scanner: Gmail IMAP (Score 3+ signals from PA scanner)
 
 Applies playbook rules (VIX kill switch, position sizing), and
 submits market orders via the IBKR Client Portal Web API.
@@ -13,6 +14,13 @@ Signal sources:
   - 8-K Item 1.01: SHORT signals with score >= 2 (from email)
   - Form4 Insider Buy Clusters: BUY signals (from local DB)
   - Form4 Insider Sells (S1/S2): SHORT signals (from local DB)
+  - Dividend Cut Score 3+: BUY signals (from email, 60-day hold)
+
+Position tracking (div cut only):
+  - positions.db tracks OPEN positions with entry date + price
+  - Day 60: auto-close at market open
+  - -40% absolute return: catastrophic circuit breaker close
+  - No stop loss. No profit target. Data-driven exit rules only.
 
 Requires: IBKR Client Portal Gateway running on localhost:5001
 
@@ -34,7 +42,7 @@ import logging
 import argparse
 import smtplib
 import urllib3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -66,6 +74,13 @@ MAX_ORDERS = config.MAX_POSITIONS_PER_RUN
 
 FORM4_DB = SCRIPT_DIR / config.FORM4_DB
 TRADE_LOG = SCRIPT_DIR / config.TRADE_LOG_PATH
+POSITIONS_DB = SCRIPT_DIR / getattr(config, "POSITIONS_DB", "positions.db")
+
+# Dividend cut signal settings
+DIV_CUT_MIN_SCORE = 3       # Minimum net_score to enter
+DIV_CUT_HOLD_DAYS = 60      # Primary exit: Day 60
+DIV_CUT_BREAKER = -40.0     # Catastrophic circuit breaker (% return)
+DIV_CUT_LOOKBACK_DAYS = 3   # How many days back to scan for cut emails
 
 # Gmail IMAP settings (same credentials as outbound email)
 IMAP_SERVER = "imap.gmail.com"
@@ -127,8 +142,6 @@ def _parse_8k_html(html):
     Only TRADE signals (score >= 2) appear in these cards.
     """
     signals = []
-    # Each card block contains one ticker then one score badge
-    # We match them in sequence across the HTML
     pattern = r'font-size:22px;font-weight:bold">([\w.\-]+)</span>.*?Score\s+(\d+)'
     matches = re.findall(pattern, html, re.DOTALL)
 
@@ -164,21 +177,15 @@ def query_8k_signals_from_email(today_str):
     try:
         mail.select("INBOX")
 
-        # Search for 8-K SHORT emails from today
-        # IMAP date format: DD-Mon-YYYY
         dt = datetime.strptime(today_str, "%Y-%m-%d")
         imap_date = dt.strftime("%d-%b-%Y")
 
-        # Try today's date first
         typ, data = mail.search(None,
             f'(SUBJECT "8-K SHORT:" SINCE "{imap_date}")')
-
         msg_ids = data[0].split() if data[0] else []
 
-        # If nothing today, try most recent 8-K SHORT email (last 7 days)
         if not msg_ids:
             logger.info("No 8-K SHORT email today — checking last 7 days")
-            from datetime import timedelta
             week_ago = (dt - timedelta(days=7)).strftime("%d-%b-%Y")
             typ, data = mail.search(None,
                 f'(SUBJECT "8-K SHORT:" SINCE "{week_ago}")')
@@ -189,7 +196,6 @@ def query_8k_signals_from_email(today_str):
             mail.logout()
             return signals
 
-        # Take the most recent (last in list)
         latest_id = msg_ids[-1]
         typ, msg_data = mail.fetch(latest_id, "(RFC822)")
 
@@ -201,12 +207,10 @@ def query_8k_signals_from_email(today_str):
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
 
-        # Log the email subject and date for confirmation
         subj = msg.get("Subject", "")
         sent = msg.get("Date", "")
         logger.info(f"8-K email found: '{subj}' ({sent})")
 
-        # Extract HTML body
         html_body = None
         if msg.is_multipart():
             for part in msg.walk():
@@ -238,7 +242,136 @@ def query_8k_signals_from_email(today_str):
 
 
 # ---------------------------------------------------------------------------
-# Form4 signals — read from local DB (DB lives in form4_scanner folder)
+# Dividend Cut signals — parsed from Gmail IMAP
+# ---------------------------------------------------------------------------
+
+def _parse_div_cut_html(html):
+    """
+    Extract (ticker, net_score) pairs from dividend cut scanner HTML email.
+
+    Scans each cut card. Only returns signals with net_score >= DIV_CUT_MIN_SCORE.
+    Card structure: class="cut-card ..." contains a ticker span and net score metric.
+    """
+    signals = []
+
+    # Split HTML into individual cut cards
+    card_blocks = html.split('class="cut-card')
+    if len(card_blocks) <= 1:
+        return signals
+
+    for card in card_blocks[1:]:
+        # Extract ticker
+        ticker_match = re.search(r'class="ticker">([A-Z][A-Z0-9.\-]*)</span>', card)
+        if not ticker_match:
+            continue
+        ticker = ticker_match.group(1).strip()
+
+        # Extract net score — appears as +N or -N just before "NET SCORE" label
+        score_match = re.search(
+            r'>([\+\-]?\d+)</div>\s*<div class="metric-label">NET SCORE</div>',
+            card
+        )
+        if not score_match:
+            continue
+
+        try:
+            net_score = int(score_match.group(1))
+        except ValueError:
+            continue
+
+        if net_score < DIV_CUT_MIN_SCORE:
+            continue
+
+        signals.append({
+            "source": "DIV_CUT",
+            "ticker": ticker,
+            "direction": "BUY",
+            "score": net_score,
+            "price": None,
+            "company": "",
+            "sector": "",
+            "detail": f"Dividend Cut Score {net_score}, 60-day hold",
+        })
+
+    return signals
+
+
+def query_div_cut_signals(today_str):
+    """
+    Search Gmail for recent dividend cut scanner emails and parse BUY signals.
+
+    Searches last DIV_CUT_LOOKBACK_DAYS days for 'Dividend Cut ALERT' emails.
+    Only returns signals with net_score >= DIV_CUT_MIN_SCORE (default: 3).
+    """
+    signals = []
+    mail = _connect_gmail()
+    if not mail:
+        logger.warning("Div cut signals unavailable — Gmail IMAP failed")
+        return signals
+
+    try:
+        mail.select("INBOX")
+
+        dt = datetime.strptime(today_str, "%Y-%m-%d")
+        since_date = (dt - timedelta(days=DIV_CUT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+
+        typ, data = mail.search(None,
+            f'(SUBJECT "Dividend Cut ALERT" SINCE "{since_date}")')
+        msg_ids = data[0].split() if data[0] else []
+
+        if not msg_ids:
+            logger.info("No Dividend Cut ALERT emails in last 3 days")
+            mail.logout()
+            return signals
+
+        # Process all matching emails (could be multiple days' worth)
+        seen_tickers = set()
+        for msg_id in msg_ids:
+            typ, msg_data = mail.fetch(msg_id, "(RFC822)")
+            if not msg_data or not msg_data[0]:
+                continue
+
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+            subj = msg.get("Subject", "")
+            sent = msg.get("Date", "")
+            logger.info(f"Div cut email found: '{subj}' ({sent})")
+
+            html_body = None
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/html":
+                        html_body = part.get_payload(decode=True).decode(
+                            part.get_content_charset() or "utf-8", errors="replace")
+                        break
+            elif msg.get_content_type() == "text/html":
+                html_body = msg.get_payload(decode=True).decode(
+                    msg.get_content_charset() or "utf-8", errors="replace")
+
+            if not html_body:
+                continue
+
+            parsed = _parse_div_cut_html(html_body)
+            for s in parsed:
+                if s["ticker"] not in seen_tickers:
+                    seen_tickers.add(s["ticker"])
+                    signals.append(s)
+
+        logger.info(f"Div cut signals (Score {DIV_CUT_MIN_SCORE}+): {len(signals)} BUY")
+
+    except Exception as e:
+        logger.error(f"Div cut email parse failed: {e}")
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Form4 signals — read from local DB
 # ---------------------------------------------------------------------------
 
 def query_form4_signals(today_str):
@@ -254,7 +387,6 @@ def query_form4_signals(today_str):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Buy clusters
         cur.execute("""
             SELECT issuer_ticker, alert_type, details
             FROM sent_alerts
@@ -268,14 +400,13 @@ def query_form4_signals(today_str):
                     "source": "F4_BUY_CLUSTER",
                     "ticker": row["issuer_ticker"],
                     "direction": "BUY",
-                    "score": 3,  # Clusters are high-conviction
+                    "score": 3,
                     "price": None,
                     "company": "",
                     "sector": "",
                     "detail": row["details"] or "Insider buy cluster",
                 })
 
-        # Sell signals (S1 and S2)
         cur.execute("""
             SELECT issuer_ticker, alert_type, details
             FROM sent_alerts
@@ -321,7 +452,6 @@ MA_KEYWORDS = [
 def check_ma_risk(ticker):
     """
     Check if ticker has recent M&A news that would invalidate a short signal.
-    Scans the last 10 yfinance news headlines for M&A keywords.
     Returns (is_risky: bool, reason: str or None).
     """
     try:
@@ -341,7 +471,7 @@ def check_ma_risk(ticker):
         return False, None
     except Exception as e:
         logger.warning(f"M&A check failed for {ticker}: {e}")
-        return False, None  # Don't block trade on check failure
+        return False, None
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +588,7 @@ def place_order(account_id, conid, side, quantity):
         "orders": [{
             "conid": conid,
             "orderType": "MKT",
-            "side": side,  # "BUY" or "SELL"
+            "side": side,
             "quantity": quantity,
             "tif": "DAY",
         }]
@@ -468,7 +598,6 @@ def place_order(account_id, conid, side, quantity):
     if not result:
         return None
 
-    # Handle order confirmation prompts
     if isinstance(result, list) and len(result) > 0:
         item = result[0]
         if item.get("id") and item.get("message"):
@@ -481,6 +610,177 @@ def place_order(account_id, conid, side, quantity):
             return item["order_id"]
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Positions database — Dividend Cut tracker
+# ---------------------------------------------------------------------------
+
+def init_positions_db():
+    """Create positions.db with open_positions table if it doesn't exist."""
+    conn = sqlite3.connect(str(POSITIONS_DB))
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS open_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            direction TEXT NOT NULL DEFAULT 'BUY',
+            entry_date TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            shares INTEGER NOT NULL,
+            position_size REAL NOT NULL,
+            order_id TEXT,
+            source TEXT DEFAULT 'DIV_CUT',
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            close_date TEXT,
+            close_price REAL,
+            close_reason TEXT,
+            return_pct REAL,
+            UNIQUE(ticker, entry_date)
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"Positions DB ready: {POSITIONS_DB}")
+
+
+def log_position_entry(ticker, entry_date, entry_price, shares, position_size,
+                       order_id=None, source="DIV_CUT"):
+    """Write a new OPEN position to positions.db."""
+    try:
+        conn = sqlite3.connect(str(POSITIONS_DB))
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR IGNORE INTO open_positions
+            (ticker, direction, entry_date, entry_price, shares, position_size, order_id, source, status)
+            VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, 'OPEN')
+        """, (ticker, entry_date, entry_price, shares, position_size, order_id, source))
+        conn.commit()
+        conn.close()
+        logger.info(f"  Position logged: {ticker} | {shares} shares @ ${entry_price:.2f} | Entry: {entry_date}")
+    except Exception as e:
+        logger.error(f"Failed to log position entry for {ticker}: {e}")
+
+
+def check_and_close_positions(account_id, dry_run, vix):
+    """
+    Run at the top of every daily execution before processing new signals.
+
+    For each OPEN position:
+      - Fetch current price
+      - Calculate days held and return %
+      - Day 60: submit SELL (or dry-run log), mark CLOSED, reason=DAY_60
+      - Return <= -40%: submit SELL, mark CLOSED, reason=CATASTROPHIC_BREAKER
+
+    Returns list of dicts describing closed positions for the summary email.
+    """
+    closed_today = []
+
+    if not POSITIONS_DB.exists():
+        return closed_today
+
+    try:
+        conn = sqlite3.connect(str(POSITIONS_DB))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, ticker, entry_date, entry_price, shares, position_size, order_id
+            FROM open_positions
+            WHERE status = 'OPEN'
+        """)
+        open_positions = c.fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to read open positions: {e}")
+        return closed_today
+
+    if not open_positions:
+        logger.info("No open div cut positions to check.")
+        return closed_today
+
+    logger.info(f"Checking {len(open_positions)} open div cut position(s)...")
+    today = date.today()
+
+    for pos in open_positions:
+        ticker = pos["ticker"]
+        entry_date = datetime.strptime(pos["entry_date"], "%Y-%m-%d").date()
+        entry_price = pos["entry_price"]
+        shares = pos["shares"]
+        pos_id = pos["id"]
+
+        days_held = (today - entry_date).days
+
+        # Fetch current price
+        current_price = fetch_live_price(ticker)
+        if not current_price:
+            logger.warning(f"  {ticker}: price fetch failed — cannot evaluate exit")
+            continue
+
+        return_pct = ((current_price - entry_price) / entry_price) * 100
+
+        logger.info(
+            f"  {ticker}: entry={entry_price:.2f} | now={current_price:.2f} | "
+            f"return={return_pct:+.1f}% | days={days_held}"
+        )
+
+        close_reason = None
+        if days_held >= DIV_CUT_HOLD_DAYS:
+            close_reason = "DAY_60"
+            logger.info(f"  {ticker}: DAY_60 exit triggered ({days_held} days held)")
+        elif return_pct <= DIV_CUT_BREAKER:
+            close_reason = "CATASTROPHIC_BREAKER"
+            logger.warning(f"  {ticker}: CATASTROPHIC BREAKER triggered ({return_pct:.1f}%)")
+
+        if close_reason is None:
+            continue
+
+        # Execute close
+        close_order_id = None
+        close_status = "DRY_RUN_CLOSE" if dry_run else "CLOSE_FAILED"
+
+        if not dry_run:
+            conid = search_contract(ticker)
+            if conid and account_id:
+                close_order_id = place_order(account_id, conid, "SELL", shares)
+                if close_order_id:
+                    close_status = "CLOSED"
+                    logger.info(f"  {ticker}: SELL {shares} shares — Order ID {close_order_id}")
+                else:
+                    logger.error(f"  {ticker}: SELL order failed")
+            else:
+                logger.error(f"  {ticker}: cannot close — no conid or account_id")
+
+        # Mark closed in DB
+        try:
+            conn = sqlite3.connect(str(POSITIONS_DB))
+            c = conn.cursor()
+            c.execute("""
+                UPDATE open_positions
+                SET status = 'CLOSED',
+                    close_date = ?,
+                    close_price = ?,
+                    close_reason = ?,
+                    return_pct = ?
+                WHERE id = ?
+            """, (today.isoformat(), current_price, close_reason, round(return_pct, 2), pos_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to update position close for {ticker}: {e}")
+
+        closed_today.append({
+            "ticker": ticker,
+            "entry_date": pos["entry_date"],
+            "entry_price": entry_price,
+            "close_price": current_price,
+            "close_reason": close_reason,
+            "return_pct": round(return_pct, 2),
+            "days_held": days_held,
+            "shares": shares,
+            "status": close_status,
+        })
+
+    return closed_today
 
 
 # ---------------------------------------------------------------------------
@@ -521,15 +821,19 @@ def log_trade(signal, shares, size, status, order_id=None, vix=None):
 # Email summary
 # ---------------------------------------------------------------------------
 
-def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False):
+def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
+                       positions_closed=None):
     """Send execution summary email."""
     today_str = date.today().strftime("%Y-%m-%d")
     mode = "DRY RUN" if dry_run else "LIVE"
     total = len(signals_executed) + len(signals_skipped)
+    closed_count = len(positions_closed) if positions_closed else 0
 
     subject = f"IB AutoTrader [{mode}] — {len(signals_executed)} orders, {today_str}"
-    if total == 0:
+    if total == 0 and closed_count == 0:
         subject = f"IB AutoTrader [{mode}] — No signals, {today_str}"
+    elif closed_count > 0 and total == 0:
+        subject = f"IB AutoTrader [{mode}] — {closed_count} position(s) closed, {today_str}"
 
     lines = []
     lines.append(f"IB AUTO-TRADER EXECUTION SUMMARY")
@@ -538,8 +842,23 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False):
     lines.append(f"VIX: {vix:.2f}" if vix else "VIX: N/A")
     lines.append("")
 
+    # Closed positions section
+    if positions_closed:
+        lines.append(f"POSITIONS CLOSED TODAY ({closed_count}):")
+        lines.append("-" * 50)
+        for p in positions_closed:
+            reason_label = "Day 60 Exit" if p["close_reason"] == "DAY_60" else "CATASTROPHIC BREAKER"
+            lines.append(
+                f"  SELL {p['ticker']:<8s} "
+                f"{p['shares']:>4d} shares | "
+                f"Entry: ${p['entry_price']:.2f} → Close: ${p['close_price']:.2f} | "
+                f"Return: {p['return_pct']:+.1f}% | "
+                f"{p['days_held']}d held | {reason_label} | {p['status']}"
+            )
+        lines.append("")
+
     if signals_executed:
-        lines.append(f"ORDERS PLACED ({len(signals_executed)}):")
+        lines.append(f"NEW ORDERS PLACED ({len(signals_executed)}):")
         lines.append("-" * 50)
         for s in signals_executed:
             lines.append(
@@ -559,7 +878,7 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False):
             )
         lines.append("")
 
-    if not signals_executed and not signals_skipped:
+    if not signals_executed and not signals_skipped and not positions_closed:
         lines.append("No signals from any scanner tonight.")
 
     body = "\n".join(lines)
@@ -593,21 +912,48 @@ def run(dry_run=False, verbose=False):
     logger.info(f"Date: {today_str}")
     logger.info("=" * 60)
 
-    # Step 1: VIX check
+    # Step 1: Init positions DB
+    init_positions_db()
+
+    # Step 2: VIX check
     vix = get_current_vix()
     if vix is not None and vix >= VIX_KILL:
         logger.warning(f"VIX KILL SWITCH: {vix:.2f} >= {VIX_KILL}. Skipping ALL trades.")
         send_summary_email([], [], vix, dry_run)
         return
 
-    # Step 2: Gather signals
+    # Step 3: IB Gateway check (skip in dry-run)
+    account_id = None
+    if not dry_run:
+        if not check_ib_connection():
+            logger.error("Cannot connect to IB Gateway. Aborting.")
+            send_summary_email([], [], vix, dry_run)
+            return
+
+        account_id = get_account_id()
+        if not account_id:
+            logger.error("No account ID. Aborting.")
+            send_summary_email([], [], vix, dry_run)
+            return
+
+    # Step 4: Check and close open div cut positions BEFORE processing new signals
+    logger.info("-" * 60)
+    logger.info("CHECKING OPEN POSITIONS FOR EXITS...")
+    logger.info("-" * 60)
+    positions_closed = check_and_close_positions(account_id, dry_run, vix)
+
+    # Step 5: Gather new entry signals
+    logger.info("-" * 60)
+    logger.info("GATHERING NEW SIGNALS...")
+    logger.info("-" * 60)
     signals = []
     signals.extend(query_8k_signals_from_email(today_str))
     signals.extend(query_form4_signals(today_str))
+    signals.extend(query_div_cut_signals(today_str))
 
     if not signals:
-        logger.info("No signals tonight.")
-        send_summary_email([], [], vix, dry_run)
+        logger.info("No new signals tonight.")
+        send_summary_email([], [], vix, dry_run, positions_closed)
         return
 
     logger.info(f"Total signals: {len(signals)}")
@@ -621,25 +967,27 @@ def run(dry_run=False, verbose=False):
     signals = list(seen.values())
     logger.info(f"After dedup: {len(signals)}")
 
-    # Step 3: IB Gateway check (skip in dry-run)
-    account_id = None
-    if not dry_run:
-        if not check_ib_connection():
-            logger.error("Cannot connect to IB Gateway. Aborting.")
-            for s in signals:
-                s["skip_reason"] = "IB Gateway offline"
-            send_summary_email([], signals, vix, dry_run)
-            return
+    # Filter out div cut tickers that already have an OPEN position
+    if POSITIONS_DB.exists():
+        try:
+            conn = sqlite3.connect(str(POSITIONS_DB))
+            c = conn.cursor()
+            c.execute("SELECT ticker FROM open_positions WHERE status = 'OPEN'")
+            already_open = {row[0] for row in c.fetchall()}
+            conn.close()
+        except Exception:
+            already_open = set()
 
-        account_id = get_account_id()
-        if not account_id:
-            logger.error("No account ID. Aborting.")
-            for s in signals:
-                s["skip_reason"] = "No account ID"
-            send_summary_email([], signals, vix, dry_run)
-            return
+        pre_filter_count = len(signals)
+        signals = [
+            s for s in signals
+            if not (s["source"] == "DIV_CUT" and s["ticker"] in already_open)
+        ]
+        filtered = pre_filter_count - len(signals)
+        if filtered > 0:
+            logger.info(f"Filtered {filtered} div cut signal(s) — positions already open")
 
-    # Step 4: Process each signal
+    # Step 6: Process each signal
     executed = []
     skipped = []
     order_count = 0
@@ -692,6 +1040,17 @@ def run(dry_run=False, verbose=False):
 
         if dry_run:
             log_trade(signal, shares, size, "DRY_RUN", vix=vix)
+            # Log div cut entries to positions DB even in dry-run
+            if signal["source"] == "DIV_CUT":
+                log_position_entry(
+                    ticker=ticker,
+                    entry_date=today_str,
+                    entry_price=live_price,
+                    shares=shares,
+                    position_size=size,
+                    order_id="DRY_RUN",
+                    source="DIV_CUT",
+                )
             executed.append(signal)
             order_count += 1
             continue
@@ -709,6 +1068,17 @@ def run(dry_run=False, verbose=False):
         if order_id:
             logger.info(f"  ORDER PLACED: {side} {shares} {ticker} — ID {order_id}")
             log_trade(signal, shares, size, "FILLED", order_id=order_id, vix=vix)
+            # Log div cut entries to positions tracker
+            if signal["source"] == "DIV_CUT":
+                log_position_entry(
+                    ticker=ticker,
+                    entry_date=today_str,
+                    entry_price=live_price,
+                    shares=shares,
+                    position_size=size,
+                    order_id=str(order_id),
+                    source="DIV_CUT",
+                )
             executed.append(signal)
             order_count += 1
         else:
@@ -716,12 +1086,15 @@ def run(dry_run=False, verbose=False):
             skipped.append(signal)
             log_trade(signal, shares, size, "ORDER_FAILED", vix=vix)
 
-    # Step 5: Summary
+    # Step 7: Summary
     logger.info("=" * 60)
-    logger.info(f"RESULTS: {len(executed)} executed, {len(skipped)} skipped")
+    logger.info(
+        f"RESULTS: {len(executed)} executed, {len(skipped)} skipped, "
+        f"{len(positions_closed)} position(s) closed"
+    )
     logger.info("=" * 60)
 
-    send_summary_email(executed, skipped, vix, dry_run)
+    send_summary_email(executed, skipped, vix, dry_run, positions_closed)
 
 
 # ---------------------------------------------------------------------------

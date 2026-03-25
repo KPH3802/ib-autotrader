@@ -38,6 +38,7 @@ EIGHT_K_DB = "../eight_k_scanner/eight_k_filings.db"
 FORM4_DB = "../form4_scanner/form4_insider_trades.db"
 
 # ---------------------------------------------------------------------------
-# Trade log
+# Trade log and position tracker
 # ---------------------------------------------------------------------------
 TRADE_LOG_PATH = "trade_log.csv"
+POSITIONS_DB = "positions.db"    # Tracks open div cut positions for exit management
