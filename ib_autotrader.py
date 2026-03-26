@@ -80,7 +80,7 @@ POSITIONS_DB = SCRIPT_DIR / getattr(config, "POSITIONS_DB", "positions.db")
 DIV_CUT_MIN_SCORE = 3       # Minimum net_score to enter
 DIV_CUT_HOLD_DAYS = 60      # Primary exit: Day 60
 DIV_CUT_BREAKER = -40.0     # Catastrophic circuit breaker (% return)
-DIV_CUT_LOOKBACK_DAYS = 3   # How many days back to scan for cut emails
+DIV_CUT_LOOKBACK_DAYS = 1   # How many days back to scan for cut emails (1 = today's email only — matches backtest entry timing)
 
 # Gmail IMAP settings (same credentials as outbound email)
 IMAP_SERVER = "imap.gmail.com"
@@ -254,24 +254,52 @@ def _parse_div_cut_html(html):
     """
     signals = []
 
-    # Split HTML into individual cut cards
-    card_blocks = html.split('class="cut-card')
-    if len(card_blocks) <= 1:
+    # --- Debug: log what we're working with ---
+    html_len = len(html) if html else 0
+    logger.info(f"  Div cut HTML: {html_len} chars")
+    if html_len < 100:
+        logger.warning(f"  Div cut HTML suspiciously short: '{html[:200]}'")
         return signals
 
+    # --- Primary parser: split on cut-card class attribute ---
+    # Gmail may modify HTML in transit; if this fails we fall back to a looser approach
+    card_blocks = html.split('class="cut-card')
+    if len(card_blocks) <= 1:
+        # Fallback: try single-quote variant (some mail clients use single quotes)
+        card_blocks = html.split("class='cut-card")
+
+    if len(card_blocks) <= 1:
+        logger.warning(f"  Div cut HTML: no cut-card blocks found. First 400 chars: {html[:400]}")
+        return signals
+
+    logger.info(f"  Div cut HTML: {len(card_blocks) - 1} cut-card block(s) found")
+
     for card in card_blocks[1:]:
-        # Extract ticker
-        ticker_match = re.search(r'class="ticker">([A-Z][A-Z0-9.\-]*)</span>', card)
+        # Extract ticker — try class="ticker" first, then class='ticker'
+        ticker_match = (
+            re.search(r'class="ticker">([A-Z][A-Z0-9.\-]*)</span>', card)
+            or re.search(r"class='ticker'>([A-Z][A-Z0-9.\-]*)</span>", card)
+            or re.search(r'class=["\']ticker["\']>([A-Z][A-Z0-9.\-]*)</span>', card)
+        )
         if not ticker_match:
+            logger.debug(f"  Div cut: no ticker found in card block (first 200 chars): {card[:200]}")
             continue
         ticker = ticker_match.group(1).strip()
 
-        # Extract net score — appears as +N or -N just before "NET SCORE" label
-        score_match = re.search(
-            r'>([\+\-]?\d+)</div>\s*<div class="metric-label">NET SCORE</div>',
-            card
+        # Extract net score — appears as +N or -N just before NET SCORE label.
+        # Try both class="metric-label" and class='metric-label' variants.
+        score_match = (
+            re.search(
+                r'>([\+\-]?\d+)</div>\s*<div[^>]+class=["\']metric-label["\']>NET SCORE',
+                card
+            )
+            or re.search(
+                r'>([\+\-]?\d+)<\/div>\s*<div[^>]*>NET SCORE',
+                card
+            )
         )
         if not score_match:
+            logger.warning(f"  Div cut: no NET SCORE found for {ticker}. Card snippet: {card[:300]}")
             continue
 
         try:
@@ -279,7 +307,9 @@ def _parse_div_cut_html(html):
         except ValueError:
             continue
 
+        logger.info(f"  Div cut: {ticker} net_score={net_score:+d}")
         if net_score < DIV_CUT_MIN_SCORE:
+            logger.info(f"  Div cut: {ticker} score {net_score} below threshold {DIV_CUT_MIN_SCORE} — skip")
             continue
 
         signals.append({
