@@ -1,12 +1,13 @@
 # IB Auto-Trader — Equity Signal Execution Layer
 
-Reads tonight's signals from the 8-K and Form4 scanner databases, applies playbook rules, and submits market orders via the IBKR Client Portal Web API.
+Reads nightly signals from three sources — 8-K scanner emails, Form4 insider activity, and Dividend Cut scanner emails — applies playbook rules, and submits market orders via the IBKR Client Portal Web API. Includes a 60-day position tracker for long dividend cut positions.
 
 ## Signal Sources
 
 | Source | Direction | Trigger |
 |--------|-----------|---------|
-| 8-K Item 1.01 | SHORT | `signal_score >= 2`, today's scan |
+| 8-K Item 1.01 | SHORT | Score >= 2, parsed from Gmail IMAP |
+| Dividend Cut Score 3+ | BUY | Net score >= 3, parsed from Gmail IMAP, 60-day hold |
 | Form4 Insider Buy Cluster | BUY | 2+ insiders buying same ticker within 14 days |
 | Form4 Insider Sell S1 | SHORT | Officer+Director selling $250K-$5M |
 | Form4 Insider Sell S2 | SHORT | Officer OR Director selling $250K-$5M |
@@ -15,21 +16,21 @@ Reads tonight's signals from the 8-K and Form4 scanner databases, applies playbo
 
 - **VIX Kill Switch:** Skip ALL trades if VIX >= 30
 - **Position Sizing:** Score 2 = $2,500 (half), Score 3+ = $5,000 (full)
-- **S1 sells** map to Score 3 (full size), **S2 sells** map to Score 2 (half size)
-- **Buy clusters** map to Score 3 (full size)
+- **M&A Filter:** Skip 8-K shorts if acquisition/merger news detected via yfinance
+- **Div Cut Exits:** Day 60 time exit OR -40% catastrophic circuit breaker. No stop loss. No profit target.
 - **Max orders per run:** 10 (configurable)
 
 ## Prerequisites
 
-1. **IBKR Client Portal Gateway** must be running locally on port 5000.
+1. **IBKR Client Portal Gateway** running locally on port 7462.
    - Download from: https://www.interactivebrokers.com/en/trading/ib-api.php
-   - Unzip, then run: `bin/run.sh root/conf.yaml`
-   - Log in via browser at https://localhost:5000
-   - The gateway uses a self-signed SSL certificate (the script handles this)
+   - Unzip to `clientportal_new/`, edit `root/conf.yaml` to set port 7462
+   - Run via the included `Start_IB_Gateway.command` desktop script
+   - Log in via browser at https://localhost:7462
 
-2. **Paper trading account** — log into the gateway with your paper account credentials.
+2. **Paper or live trading account** — log into the gateway with your IBKR credentials.
 
-3. **Scanner databases** — the 8-K scanner (21:45 UTC) and Form4 scanner (22:00 UTC) must have already run tonight.
+3. **PA scanners running nightly** — 8-K scanner (21:45 UTC), Form4 scanner (22:00 UTC), Dividend Cut scanner (23:30 UTC) must be active on PythonAnywhere.
 
 ## Setup
 
@@ -37,13 +38,13 @@ Reads tonight's signals from the 8-K and Form4 scanner databases, applies playbo
 cd ib_execution/
 pip3 install -r requirements.txt
 cp config_example.py config.py
-# Edit config.py with your email and IB settings
+# Edit config.py with your email, IBKR, and path settings
 ```
 
 ## Usage
 
 ```bash
-# Dry run — see what would trade, no orders placed
+# Dry run — log signals and size positions, no orders placed
 python3 ib_autotrader.py --dry-run
 
 # Verbose dry run — full detail
@@ -53,19 +54,37 @@ python3 ib_autotrader.py --dry-run -v
 python3 ib_autotrader.py
 ```
 
+## Automated Daily Execution (macOS cron)
+
+`run_ib_autotrader.sh` is a cron wrapper that fires at 8:00 CT Monday–Friday. Install with:
+
+```bash
+chmod +x run_ib_autotrader.sh
+(crontab -l 2>/dev/null; echo "0 8 * * 1-5 /path/to/ib_execution/run_ib_autotrader.sh") | crontab -
+```
+
+Output is logged to `cron_run.log` (auto-rotates at 500 lines). To go live, remove `--dry-run` from the last line of the script.
+
+**Note:** The IBKR Gateway and browser login must be completed manually before the cron job fires — authentication cannot be automated.
+
 ## Output
 
 - **trade_log.csv** — every signal processed (executed or skipped), appended per run
-- **Email summary** — sent after each run with orders placed and signals skipped
+- **positions.db** — open dividend cut positions tracked for exit management
+- **cron_run.log** — automated run log
+- **Email summary** — sent after each run with orders placed, signals skipped, and positions closed
 
 ## File Structure
 
 ```
 ib_execution/
-  ib_autotrader.py      # Main script
-  config_example.py     # Template — copy to config.py
-  config.py             # Your settings (git-ignored)
-  trade_log.csv         # Trade log (git-ignored)
+  ib_autotrader.py        # Main script
+  run_ib_autotrader.sh    # Cron wrapper for automated daily execution
+  config_example.py       # Template — copy to config.py
+  config.py               # Your settings (git-ignored)
+  trade_log.csv           # Trade log (git-ignored)
+  positions.db            # Open position tracker (git-ignored)
+  cron_run.log            # Cron run log (git-ignored)
   requirements.txt
   README.md
   .gitignore
@@ -73,11 +92,28 @@ ib_execution/
 
 ## How It Works
 
-1. Fetch VIX via yfinance — abort if >= 30
-2. Query `eight_k_filings.db` for today's SHORT signals (score >= 2)
-3. Query `form4_insider_trades.db` for today's BUY clusters and S1/S2 sells
-4. Deduplicate (same ticker+direction keeps highest score)
-5. For each signal: fetch live price, calculate shares, look up IB contract ID
-6. Place market orders via IB Client Portal REST API
-7. Log everything to trade_log.csv
-8. Send summary email
+1. Fetch VIX via yfinance — abort all trades if >= 30
+2. Check open div cut positions for Day 60 exits or -40% circuit breaker closes
+3. Parse today's 8-K SHORT email from Gmail IMAP (7-day fallback)
+4. Query Form4 DB for today's insider buy clusters and S1/S2 sells
+5. Parse today's Dividend Cut ALERT email from Gmail IMAP (Score 3+ only)
+6. Deduplicate signals (same ticker+direction keeps highest score)
+7. Filter div cut signals for already-open positions
+8. For each signal: M&A check, fetch live price, calculate shares, look up IB contract ID
+9. Place market orders via IB Client Portal REST API
+10. Log entries to trade_log.csv and positions.db
+11. Send summary email with all executed orders and any closed positions
+
+## Backtest Performance
+
+| Signal | Alpha | Basis |
+|--------|-------|-------|
+| 8-K Item 1.01 shorts | -2.89% at 5d (t=-9.98) | 2020–2025, n=500+ |
+| Dividend Cut Score 3+ longs | +15.77% at 60d | 2020–2025, era-validated |
+| Insider buy clusters | +0.60% per trade | 2020–2025, clean |
+
+## Disclaimer
+
+This software is for educational and research purposes. Trading involves substantial risk of loss. Past backtest performance does not guarantee future results.
+
+MIT License
