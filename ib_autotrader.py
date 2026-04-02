@@ -532,6 +532,64 @@ def query_si_squeeze_signals_from_email(today_str):
         except Exception: pass
     return signals
 
+
+# ---------------------------------------------------------------------------
+# COT signals -- parsed from Gmail IMAP
+# ---------------------------------------------------------------------------
+
+def query_cot_signals_from_email(today_str):
+    """Parse COT BULL/BEAR signals. Subject: 'COT BULL: XOP, GLD | COT BEAR: USO'."""
+    import re
+    signals = []
+    mail = _connect_gmail()
+    if not mail:
+        logger.warning('COT signals unavailable -- Gmail IMAP failed')
+        return signals
+    try:
+        mail.select('INBOX')
+        dt = datetime.strptime(today_str, '%Y-%m-%d')
+        since_date = (dt - timedelta(days=7)).strftime('%d-%b-%Y')
+        typ, data = mail.search(None, f'(SUBJECT "COT" SINCE "{since_date}")')
+        msg_ids = data[0].split() if data[0] else []
+        if not msg_ids:
+            logger.info('No COT emails in lookback window')
+            mail.logout()
+            return signals
+        seen = set()
+        for msg_id in msg_ids[-2:]:
+            typ, msg_data = mail.fetch(msg_id, '(RFC822)')
+            if not msg_data or not msg_data[0]: continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subj = msg.get('Subject', '')
+            logger.info(f"COT email: '{subj}'")
+            if 'COT BULL:' not in subj and 'COT BEAR:' not in subj:
+                continue
+            bull = re.search(r'COT BULL:\s*([A-Z ,]+?)(?:\s*\||$)', subj)
+            if bull:
+                for t in bull.group(1).split(','):
+                    t = t.strip()
+                    if t and t not in seen:
+                        seen.add(t)
+                        signals.append({'source':'COT_BULL','ticker':t,'direction':'BUY',
+                                        'score':3,'price':None,'company':'','sector':'',
+                                        'detail':'COT commercial extreme long signal'})
+            bear = re.search(r'COT BEAR:\s*([A-Z ,]+?)(?:\s*\||$)', subj)
+            if bear:
+                for t in bear.group(1).split(','):
+                    t = t.strip()
+                    if t and t not in seen:
+                        seen.add(t)
+                        signals.append({'source':'COT_BEAR','ticker':t,'direction':'SHORT',
+                                        'score':3,'price':None,'company':'','sector':'',
+                                        'detail':'COT commercial extreme short signal'})
+        logger.info(f'COT signals: {len([s for s in signals if s[chr(34)+"direction"+chr(34)]=="BUY"])} BULL, {len([s for s in signals if s[chr(34)+"direction"+chr(34)]=="SHORT"])} BEAR')
+    except Exception as e:
+        logger.error(f'COT email parse failed: {e}')
+    finally:
+        try: mail.logout()
+        except Exception: pass
+    return signals
+
 # ---------------------------------------------------------------------------
 # Form4 signals — read from local DB
 # ---------------------------------------------------------------------------
@@ -1130,6 +1188,7 @@ def run(dry_run=False, verbose=False):
     signals.extend(query_div_cut_signals(today_str))
     signals.extend(query_pead_signals_from_email(today_str))
     signals.extend(query_si_squeeze_signals_from_email(today_str))
+    signals.extend(query_cot_signals_from_email(today_str))
 
     if not signals:
         logger.info("No new signals tonight.")
@@ -1159,7 +1218,7 @@ def run(dry_run=False, verbose=False):
             already_open = set()
 
         pre_filter_count = len(signals)
-        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "SI_SQUEEZE"}
+        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "SI_SQUEEZE", "COT_BULL", "COT_BEAR"}
         signals = [
             s for s in signals
             if not (s["source"] in tracked_sources and s["ticker"] in already_open)
