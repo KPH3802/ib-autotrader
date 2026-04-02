@@ -80,7 +80,12 @@ POSITIONS_DB = SCRIPT_DIR / getattr(config, "POSITIONS_DB", "positions.db")
 DIV_CUT_MIN_SCORE = 3       # Minimum net_score to enter
 DIV_CUT_HOLD_DAYS = 60      # Primary exit: Day 60
 DIV_CUT_BREAKER = -39.9     # Catastrophic circuit breaker (% return)
-DIV_CUT_LOOKBACK_DAYS = 1   # How many days back to scan for cut emails (1 = today's email only — matches backtest entry timing)
+DIV_CUT_LOOKBACK_DAYS = 1   # How many days back
+
+# PEAD signal settings
+PEAD_HOLD_DAYS = 28         # 4-week hold (matches backtest)
+PEAD_BREAKER   = -39.9      # Catastrophic circuit breaker
+PEAD_LOOKBACK_DAYS = 2      # Check emails from last 2 days to scan for cut emails (1 = today's email only — matches backtest entry timing)
 
 # Gmail IMAP settings (same credentials as outbound email)
 IMAP_SERVER = "imap.gmail.com"
@@ -400,6 +405,74 @@ def query_div_cut_signals(today_str):
     return signals
 
 
+
+# ---------------------------------------------------------------------------
+# PEAD signals -- parsed from Gmail IMAP
+# ---------------------------------------------------------------------------
+
+def _parse_pead_subject(subject):
+    import re
+    results = []
+    bull = re.search(r'PEAD BULL:\s*([A-Z ,]+?)(?:\s*\||$)', subject)
+    if bull:
+        for t in bull.group(1).split(','):
+            t = t.strip()
+            if t: results.append((t, 'BUY'))
+    bear = re.search(r'PEAD BEAR:\s*([A-Z ,]+?)(?:\s*\||$)', subject)
+    if bear:
+        for t in bear.group(1).split(','):
+            t = t.strip()
+            if t: results.append((t, 'SHORT'))
+    return results
+
+
+def query_pead_signals_from_email(today_str):
+    """Parse PEAD BULL/BEAR signals from Gmail. BULL->BUY, BEAR->SHORT, score=3 (full size)."""
+    signals = []
+    mail = _connect_gmail()
+    if not mail:
+        logger.warning('PEAD signals unavailable -- Gmail IMAP failed')
+        return signals
+    try:
+        mail.select('INBOX')
+        dt = datetime.strptime(today_str, '%Y-%m-%d')
+        since_date = (dt - timedelta(days=PEAD_LOOKBACK_DAYS)).strftime('%d-%b-%Y')
+        typ, data = mail.search(None, f'(SUBJECT "PEAD" SINCE "{since_date}")')
+        msg_ids = data[0].split() if data[0] else []
+        if not msg_ids:
+            logger.info('No PEAD emails in lookback window')
+            mail.logout()
+            return signals
+        seen = set()
+        for msg_id in msg_ids[-3:]:
+            typ, msg_data = mail.fetch(msg_id, '(RFC822)')
+            if not msg_data or not msg_data[0]: continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subj = msg.get('Subject', '')
+            logger.info(f"PEAD email: '{subj}'")
+            if 'PEAD BULL:' not in subj and 'PEAD BEAR:' not in subj:
+                continue
+            for ticker, direction in _parse_pead_subject(subj):
+                key = (ticker, direction)
+                if key not in seen:
+                    seen.add(key)
+                    src_name = 'PEAD_BULL' if direction == 'BUY' else 'PEAD_BEAR'
+                    signals.append({
+                        'source': src_name, 'ticker': ticker,
+                        'direction': direction, 'score': 3,
+                        'price': None, 'company': '', 'sector': '',
+                        'detail': f"PEAD {'beat' if direction=='BUY' else 'miss'} >=5% EPS surprise",
+                    })
+        bulls = sum(1 for s in signals if s['direction']=='BUY')
+        bears = sum(1 for s in signals if s['direction']=='SHORT')
+        logger.info(f'PEAD signals: {bulls} BULL, {bears} BEAR')
+    except Exception as e:
+        logger.error(f'PEAD email parse failed: {e}')
+    finally:
+        try: mail.logout()
+        except Exception: pass
+    return signals
+
 # ---------------------------------------------------------------------------
 # Form4 signals — read from local DB
 # ---------------------------------------------------------------------------
@@ -675,7 +748,7 @@ def init_positions_db():
 
 
 def log_position_entry(ticker, entry_date, entry_price, shares, position_size,
-                       order_id=None, source="DIV_CUT"):
+                       order_id=None, source="DIV_CUT", direction="BUY"):
     """Write a new OPEN position to positions.db."""
     try:
         conn = sqlite3.connect(str(POSITIONS_DB))
@@ -683,8 +756,8 @@ def log_position_entry(ticker, entry_date, entry_price, shares, position_size,
         c.execute("""
             INSERT OR IGNORE INTO open_positions
             (ticker, direction, entry_date, entry_price, shares, position_size, order_id, source, status)
-            VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, 'OPEN')
-        """, (ticker, entry_date, entry_price, shares, position_size, order_id, source))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+        """, (ticker, direction, entry_date, entry_price, shares, position_size, order_id, source))
         conn.commit()
         conn.close()
         logger.info(f"  Position logged: {ticker} | {shares} shares @ ${entry_price:.2f} | Entry: {entry_date}")
@@ -714,7 +787,7 @@ def check_and_close_positions(account_id, dry_run, vix):
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("""
-            SELECT id, ticker, entry_date, entry_price, shares, position_size, order_id
+            SELECT id, ticker, entry_date, entry_price, shares, position_size, order_id, source, direction
             FROM open_positions
             WHERE status = 'OPEN'
         """)
@@ -740,13 +813,29 @@ def check_and_close_positions(account_id, dry_run, vix):
 
         days_held = (today - entry_date).days
 
+        # Source-aware hold period and close side
+        pos_source    = pos["source"] or "DIV_CUT"
+        pos_direction = pos["direction"] or "BUY"
+        if pos_source.startswith("PEAD"):
+            hold_limit    = PEAD_HOLD_DAYS
+            day_exit_lbl  = "DAY_28"
+            breaker_val   = PEAD_BREAKER
+        else:
+            hold_limit    = DIV_CUT_HOLD_DAYS
+            day_exit_lbl  = "DAY_60"
+            breaker_val   = DIV_CUT_BREAKER
+        close_side = "BUY" if pos_direction == "SHORT" else "SELL"
+
         # Fetch current price
         current_price = fetch_live_price(ticker)
         if not current_price:
             logger.warning(f"  {ticker}: price fetch failed — cannot evaluate exit")
             continue
 
-        return_pct = ((current_price - entry_price) / entry_price) * 100
+        if pos_direction == "SHORT":
+            return_pct = ((entry_price - current_price) / entry_price) * 100
+        else:
+            return_pct = ((current_price - entry_price) / entry_price) * 100
 
         logger.info(
             f"  {ticker}: entry={entry_price:.2f} | now={current_price:.2f} | "
@@ -754,10 +843,10 @@ def check_and_close_positions(account_id, dry_run, vix):
         )
 
         close_reason = None
-        if days_held >= DIV_CUT_HOLD_DAYS:
-            close_reason = "DAY_60"
-            logger.info(f"  {ticker}: DAY_60 exit triggered ({days_held} days held)")
-        elif return_pct <= DIV_CUT_BREAKER:
+        if days_held >= hold_limit:
+            close_reason = day_exit_lbl
+            logger.info(f"  {ticker}: {day_exit_lbl} exit triggered ({days_held} days held)")
+        elif return_pct <= breaker_val:
             close_reason = "CATASTROPHIC_BREAKER"
             logger.warning(f"  {ticker}: CATASTROPHIC BREAKER triggered ({return_pct:.1f}%)")
 
@@ -771,7 +860,7 @@ def check_and_close_positions(account_id, dry_run, vix):
         if not dry_run:
             conid = search_contract(ticker)
             if conid and account_id:
-                close_order_id = place_order(account_id, conid, "SELL", shares)
+                close_order_id = place_order(account_id, conid, close_side, shares)
                 if close_order_id:
                     close_status = "CLOSED"
                     logger.info(f"  {ticker}: SELL {shares} shares — Order ID {close_order_id}")
@@ -980,6 +1069,7 @@ def run(dry_run=False, verbose=False):
     signals.extend(query_8k_signals_from_email(today_str))
     signals.extend(query_form4_signals(today_str))
     signals.extend(query_div_cut_signals(today_str))
+    signals.extend(query_pead_signals_from_email(today_str))
 
     if not signals:
         logger.info("No new signals tonight.")
@@ -1009,9 +1099,10 @@ def run(dry_run=False, verbose=False):
             already_open = set()
 
         pre_filter_count = len(signals)
+        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR"}
         signals = [
             s for s in signals
-            if not (s["source"] == "DIV_CUT" and s["ticker"] in already_open)
+            if not (s["source"] in tracked_sources and s["ticker"] in already_open)
         ]
         filtered = pre_filter_count - len(signals)
         if filtered > 0:
@@ -1070,8 +1161,8 @@ def run(dry_run=False, verbose=False):
 
         if dry_run:
             log_trade(signal, shares, size, "DRY_RUN", vix=vix)
-            # Log div cut entries to positions DB even in dry-run
-            if signal["source"] == "DIV_CUT":
+            # Log tracked-source entries to positions DB even in dry-run
+            if signal["source"] in ("DIV_CUT", "PEAD_BULL", "PEAD_BEAR"):
                 log_position_entry(
                     ticker=ticker,
                     entry_date=today_str,
@@ -1079,7 +1170,8 @@ def run(dry_run=False, verbose=False):
                     shares=shares,
                     position_size=size,
                     order_id="DRY_RUN",
-                    source="DIV_CUT",
+                    source=signal["source"],
+                    direction=signal["direction"],
                 )
             executed.append(signal)
             order_count += 1
@@ -1098,8 +1190,8 @@ def run(dry_run=False, verbose=False):
         if order_id:
             logger.info(f"  ORDER PLACED: {side} {shares} {ticker} — ID {order_id}")
             log_trade(signal, shares, size, "FILLED", order_id=order_id, vix=vix)
-            # Log div cut entries to positions tracker
-            if signal["source"] == "DIV_CUT":
+            # Log tracked-source entries to positions tracker
+            if signal["source"] in ("DIV_CUT", "PEAD_BULL", "PEAD_BEAR"):
                 log_position_entry(
                     ticker=ticker,
                     entry_date=today_str,
@@ -1107,7 +1199,8 @@ def run(dry_run=False, verbose=False):
                     shares=shares,
                     position_size=size,
                     order_id=str(order_id),
-                    source="DIV_CUT",
+                    source=signal["source"],
+                    direction=signal["direction"],
                 )
             executed.append(signal)
             order_count += 1
