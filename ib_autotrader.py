@@ -473,6 +473,65 @@ def query_pead_signals_from_email(today_str):
         except Exception: pass
     return signals
 
+
+# ---------------------------------------------------------------------------
+# Short Interest Squeeze signals -- parsed from Gmail IMAP
+# ---------------------------------------------------------------------------
+
+def query_si_squeeze_signals_from_email(today_str):
+    """Parse SI Squeeze signals from Gmail. Subject: 'SI SQUEEZE: TICK1, TICK2'.
+    All tickers = BUY (long), score=3 (full size), 28-day hold."""
+    import re
+    signals = []
+    mail = _connect_gmail()
+    if not mail:
+        logger.warning('SI Squeeze signals unavailable -- Gmail IMAP failed')
+        return signals
+    try:
+        mail.select('INBOX')
+        dt = datetime.strptime(today_str, '%Y-%m-%d')
+        since_date = (dt - timedelta(days=3)).strftime('%d-%b-%Y')
+        typ, data = mail.search(None, f'(SUBJECT "SI SQUEEZE:" SINCE "{since_date}")')
+        msg_ids = data[0].split() if data[0] else []
+        if not msg_ids:
+            logger.info('No SI SQUEEZE emails in lookback window')
+            mail.logout()
+            return signals
+        seen = set()
+        for msg_id in msg_ids[-3:]:
+            typ, msg_data = mail.fetch(msg_id, '(RFC822)')
+            if not msg_data or not msg_data[0]: continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subj = msg.get('Subject', '')
+            logger.info(f"SI Squeeze email: '{subj}'")
+            if 'SI SQUEEZE:' not in subj:
+                continue
+            # Parse: 'SI SQUEEZE: TICK1, TICK2, TICK3 +N more'
+            after = subj.split('SI SQUEEZE:', 1)[1]
+            # Strip '+N more' suffix if present
+            after = re.sub(r'\+\d+ more.*', '', after)
+            for t in after.split(','):
+                ticker = t.strip().upper()
+                if ticker and re.match(r'^[A-Z]{1,5}$', ticker) and ticker not in seen:
+                    seen.add(ticker)
+                    signals.append({
+                        'source': 'SI_SQUEEZE',
+                        'ticker': ticker,
+                        'direction': 'BUY',
+                        'score': 3,
+                        'price': None,
+                        'company': '',
+                        'sector': '',
+                        'detail': 'Short interest increase >=30% squeeze signal',
+                    })
+        logger.info(f'SI Squeeze signals: {len(signals)} BUY')
+    except Exception as e:
+        logger.error(f'SI Squeeze email parse failed: {e}')
+    finally:
+        try: mail.logout()
+        except Exception: pass
+    return signals
+
 # ---------------------------------------------------------------------------
 # Form4 signals — read from local DB
 # ---------------------------------------------------------------------------
@@ -1070,6 +1129,7 @@ def run(dry_run=False, verbose=False):
     signals.extend(query_form4_signals(today_str))
     signals.extend(query_div_cut_signals(today_str))
     signals.extend(query_pead_signals_from_email(today_str))
+    signals.extend(query_si_squeeze_signals_from_email(today_str))
 
     if not signals:
         logger.info("No new signals tonight.")
@@ -1099,7 +1159,7 @@ def run(dry_run=False, verbose=False):
             already_open = set()
 
         pre_filter_count = len(signals)
-        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR"}
+        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "SI_SQUEEZE"}
         signals = [
             s for s in signals
             if not (s["source"] in tracked_sources and s["ticker"] in already_open)
