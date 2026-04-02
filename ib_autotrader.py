@@ -79,7 +79,7 @@ POSITIONS_DB = SCRIPT_DIR / getattr(config, "POSITIONS_DB", "positions.db")
 # Dividend cut signal settings
 DIV_CUT_MIN_SCORE = 3       # Minimum net_score to enter
 DIV_CUT_HOLD_DAYS = 60      # Primary exit: Day 60
-DIV_CUT_BREAKER = -40.0     # Catastrophic circuit breaker (% return)
+DIV_CUT_BREAKER = -39.9     # Catastrophic circuit breaker (% return)
 DIV_CUT_LOOKBACK_DAYS = 1   # How many days back to scan for cut emails (1 = today's email only — matches backtest entry timing)
 
 # Gmail IMAP settings (same credentials as outbound email)
