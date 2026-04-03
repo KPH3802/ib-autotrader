@@ -107,20 +107,38 @@ logger = logging.getLogger(__name__)
 # VIX check
 # ---------------------------------------------------------------------------
 
-def get_current_vix():
-    """Fetch current VIX level via yfinance."""
-    try:
-        import pandas
-        vix = yf.Ticker("^VIX")
-        hist = vix.history(period="1d")
-        if not hist.empty:
-            if isinstance(hist.columns, pandas.MultiIndex):
-                hist.columns = [c[0] for c in hist.columns]
-            close = float(hist["Close"].iloc[-1])
-            logger.info(f"VIX: {close:.2f}")
-            return close
-    except Exception as e:
-        logger.error(f"VIX fetch failed: {e}")
+def get_current_vix(timeout=30):
+    """Fetch current VIX level via yfinance. Returns None if fetch fails or times out."""
+    import threading
+    result = [None]
+    error = [None]
+
+    def _fetch():
+        try:
+            import pandas
+            vix = yf.Ticker("^VIX")
+            hist = vix.history(period="1d")
+            if not hist.empty:
+                if isinstance(hist.columns, pandas.MultiIndex):
+                    hist.columns = [c[0] for c in hist.columns]
+                result[0] = float(hist["Close"].iloc[-1])
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_fetch, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        logger.error(f"VIX fetch timed out after {timeout}s")
+        return None
+    if error[0] is not None:
+        logger.error(f"VIX fetch failed: {error[0]}")
+        return None
+    if result[0] is not None:
+        logger.info(f"VIX: {result[0]:.2f}")
+        return result[0]
+    logger.error("VIX fetch returned empty data")
     return None
 
 
@@ -1268,7 +1286,12 @@ def run(dry_run=False, verbose=False):
 
     # Step 2: VIX check
     vix = get_current_vix()
-    if vix is not None and vix >= VIX_KILL:
+    if vix is None:
+        logger.error("VIX FAIL-SAFE: VIX data unavailable. Blocking ALL new entries. Exits will still process.")
+        positions_closed = check_and_close_positions(account_id, dry_run, vix)
+        send_summary_email([], [], None, dry_run, positions_closed)
+        return
+    if vix >= VIX_KILL:
         logger.warning(f"VIX KILL SWITCH: {vix:.2f} >= {VIX_KILL}. Skipping ALL trades.")
         send_summary_email([], [], vix, dry_run)
         return
