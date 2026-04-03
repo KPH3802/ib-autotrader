@@ -1218,6 +1218,34 @@ def log_trade(signal, shares, size, status, order_id=None, vix=None):
 
 
 # ---------------------------------------------------------------------------
+# Holiday notification email
+# ---------------------------------------------------------------------------
+def send_holiday_email(today_str, dry_run=False):
+    """Send brief notification that market is closed today."""
+    mode = "DRY RUN" if dry_run else "LIVE"
+    subject = f"IB AutoTrader [{mode}] -- NYSE Closed {today_str}"
+    body = (
+        f"NYSE CLOSED: {today_str} is a market holiday.\n\n"
+        "No orders placed. No action required.\n"
+        "System is healthy -- signals will be re-evaluated next trading day.\n"
+    )
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = config.EMAIL_SENDER
+        msg["To"] = ", ".join(config.EMAIL_RECIPIENTS)
+        with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT) as s:
+            s.starttls()
+            s.login(config.EMAIL_SENDER, config.EMAIL_PASSWORD)
+            s.sendmail(config.EMAIL_SENDER, config.EMAIL_RECIPIENTS, msg.as_string())
+        logger.info(f"Holiday notification email sent: {subject}")
+    except Exception as e:
+        logger.error(f"Holiday email failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Email summary
 # ---------------------------------------------------------------------------
 
@@ -1330,6 +1358,7 @@ def run(dry_run=False, verbose=False):
     if not is_nyse_open_today():
         logger.info(f"NYSE CLOSED today ({today_str}) -- market holiday. Skipping execution.")
         logger.info("Signals re-evaluated next trading day via normal lookback window.")
+        send_holiday_email(today_str, dry_run)
         return
 
     # Step 1: Init positions DB
