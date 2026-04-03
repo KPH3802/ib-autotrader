@@ -102,6 +102,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Warnings collected during run -- appended to summary email
+system_warnings = []
+
 
 # ---------------------------------------------------------------------------
 # VIX check
@@ -233,6 +236,7 @@ def query_8k_signals_from_email(today_str):
     mail = _connect_gmail()
     if not mail:
         logger.warning("8-K signals unavailable — Gmail IMAP failed")
+        system_warnings.append("WARNING: Gmail IMAP unavailable -- signals may be missing")
         return signals
 
     try:
@@ -851,6 +855,7 @@ def check_ma_risk(ticker):
         return False, None
     except Exception as e:
         logger.warning(f"M&A check failed for {ticker}: {e}")
+        system_warnings.append(f"WARNING: M&A filter down for {ticker} -- proceeding without M&A check")
         return False, None
 
 
@@ -859,19 +864,62 @@ def check_ma_risk(ticker):
 # ---------------------------------------------------------------------------
 
 def fetch_live_price(ticker):
-    """Fetch current price via yfinance. Returns float or None."""
-    try:
-        import pandas
-        t = yf.Ticker(ticker)
-        hist = t.history(period="1d")
-        if not hist.empty:
-            if isinstance(hist.columns, pandas.MultiIndex):
-                hist.columns = [c[0] for c in hist.columns]
-            return float(hist["Close"].iloc[-1])
-    except Exception as e:
-        logger.warning(f"Price fetch failed for {ticker}: {e}")
-    return None
+    """Fetch price with fallback. yfinance -> Yahoo direct HTTP -> FMP.
+    Returns float or None only if all 3 sources fail.
+    """
+    import threading
+    result = [None]
 
+    def _fetch_yf():
+        try:
+            import pandas
+            t = yf.Ticker(ticker)
+            hist = t.history(period="1d")
+            if not hist.empty:
+                if isinstance(hist.columns, pandas.MultiIndex):
+                    hist.columns = [c[0] for c in hist.columns]
+                result[0] = float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_fetch_yf, daemon=True)
+    t.start()
+    t.join(timeout=15)
+    if result[0] is not None:
+        return result[0]
+
+    # Fallback 1: Yahoo direct HTTP
+    try:
+        import requests as req
+        encoded = req.utils.quote(ticker)
+        r = req.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+        logger.info(f"Price {ticker}: ${price:.2f} (Yahoo direct)")
+        return price
+    except Exception as e:
+        logger.warning(f"Price Yahoo direct failed for {ticker}: {e}")
+
+    # Fallback 2: FMP
+    try:
+        import requests as req
+        r = req.get(
+            f"https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={config.FMP_API_KEY}",
+            timeout=10
+        )
+        data = r.json()
+        if data and isinstance(data, list) and "price" in data[0]:
+            price = float(data[0]["price"])
+            logger.info(f"Price {ticker}: ${price:.2f} (FMP)")
+            return price
+    except Exception as e:
+        logger.warning(f"Price FMP failed for {ticker}: {e}")
+
+    logger.error(f"Price fetch failed on all 3 sources for {ticker}")
+    return None
 
 # ---------------------------------------------------------------------------
 # Position sizing
@@ -1299,6 +1347,13 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
             )
         lines.append("")
 
+    if system_warnings:
+        lines.append("SYSTEM WARNINGS:")
+        lines.append("-" * 50)
+        for w in system_warnings:
+            lines.append(f"  !! {w}")
+        lines.append("")
+        subject = subject + " [WARNINGS]"
     if signals_skipped:
         lines.append(f"SKIPPED ({len(signals_skipped)}):")
         lines.append("-" * 50)
@@ -1353,6 +1408,9 @@ def run(dry_run=False, verbose=False):
     logger.info(f"IB AUTO-TRADER — {'DRY RUN' if dry_run else 'LIVE'}")
     logger.info(f"Date: {today_str}")
     logger.info("=" * 60)
+
+    global system_warnings
+    system_warnings = []
 
     # Step 0: NYSE market holiday check
     if not is_nyse_open_today():
