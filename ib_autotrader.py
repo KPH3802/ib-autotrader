@@ -142,7 +142,7 @@ def get_current_vix(timeout=30):
     else:
         logger.warning(f"VIX yfinance failed ({yf_error[0]}) — trying fallback")
 
-    # --- Fallback: direct Yahoo Finance HTTP (bypasses yfinance library) ---
+    # --- Fallback 1: direct Yahoo Finance HTTP (bypasses yfinance library) ---
     try:
         import requests as req
         r = req.get(
@@ -154,9 +154,25 @@ def get_current_vix(timeout=30):
         logger.info(f"VIX: {price:.2f} (Yahoo direct fallback)")
         return price
     except Exception as e:
-        logger.error(f"VIX fallback also failed: {e}")
+        logger.warning(f"VIX Yahoo direct failed: {e} — trying FMP")
 
-    logger.error("VIX fetch failed on both sources — fail-safe will block new entries")
+    # --- Fallback 2: FMP quote endpoint (independent provider) ---
+    try:
+        import requests as req
+        r = req.get(
+            f"https://financialmodelingprep.com/api/v3/quote/%5EVIX?apikey={config.FMP_API_KEY}",
+            timeout=10
+        )
+        data = r.json()
+        if data and isinstance(data, list) and "price" in data[0]:
+            price = float(data[0]["price"])
+            logger.info(f"VIX: {price:.2f} (FMP fallback)")
+            return price
+        logger.warning("FMP VIX response empty or malformed")
+    except Exception as e:
+        logger.error(f"VIX FMP fallback failed: {e}")
+
+    logger.error("VIX fetch failed on all 3 sources (yfinance, Yahoo direct, FMP) — fail-safe will block new entries")
     return None
 
 
