@@ -86,6 +86,10 @@ DIV_CUT_LOOKBACK_DAYS = 1   # How many days back
 PEAD_HOLD_DAYS = 28         # 4-week hold (matches backtest)
 PEAD_BREAKER   = -39.9      # Catastrophic circuit breaker
 PEAD_LOOKBACK_DAYS = 2      # Check emails from last 2 days to scan for cut emails (1 = today's email only — matches backtest entry timing)
+# 13F Institutional Initiations signal settings
+THIRTEENF_HOLD_DAYS     = 91     # 13-week hold (matches backtest)
+THIRTEENF_BREAKER       = -39.9  # Catastrophic circuit breaker
+THIRTEENF_LOOKBACK_DAYS = 7      # Check last 7 days (scanner fires quarterly)
 
 # Gmail IMAP settings (same credentials as outbound email)
 IMAP_SERVER = "imap.gmail.com"
@@ -641,6 +645,60 @@ def query_cel_signals_from_email(today_str):
     return signals
 
 # ---------------------------------------------------------------------------
+# 13F Institutional Initiations signals -- parsed from Gmail IMAP
+# ---------------------------------------------------------------------------
+def query_13f_signals_from_email(today_str):
+    """Parse 13F BULL signals. Subject: '13F BULL: TICK1, TICK2'.
+    All tickers -> BUY, score=3 (full size), 91-day hold."""
+    signals = []
+    mail = _connect_gmail()
+    if not mail:
+        logger.warning('13F signals unavailable -- Gmail IMAP failed')
+        return signals
+    try:
+        mail.select('INBOX')
+        dt = datetime.strptime(today_str, '%Y-%m-%d')
+        since_date = (dt - timedelta(days=THIRTEENF_LOOKBACK_DAYS)).strftime('%d-%b-%Y')
+        typ, data = mail.search(None, '(SUBJECT "13F BULL:" SINCE "' + since_date + '")') 
+        msg_ids = data[0].split() if data[0] else []
+        if not msg_ids:
+            logger.info('No 13F BULL emails in lookback window')
+            mail.logout()
+            return signals
+        seen = set()
+        for msg_id in msg_ids[-3:]:
+            typ, msg_data = mail.fetch(msg_id, '(RFC822)')
+            if not msg_data or not msg_data[0]: continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            subj = msg.get('Subject', '')
+            logger.info('13F email: ' + repr(subj))
+            if '13F BULL:' not in subj: continue
+            after = subj.split('13F BULL:', 1)[1]
+            after = re.sub(r'\+\d+ more.*', '', after)
+            for t in after.split(','):
+                ticker = t.strip().upper()
+                if ticker and re.match(r'^[A-Z]{1,5}$', ticker) and ticker not in seen:
+                    seen.add(ticker)
+                    signals.append({
+                        'source':    'THIRTEENF_BULL',
+                        'ticker':    ticker,
+                        'direction': 'BUY',
+                        'score':     3,
+                        'price':     None,
+                        'company':   '',
+                        'sector':    '',
+                        'detail':    '13F initiation: 3+ hedge fund new positions same quarter',
+                    })
+        logger.info('13F signals: ' + str(len(signals)) + ' BUY')
+    except Exception as e:
+        logger.error('13F email parse failed: ' + str(e))
+    finally:
+        try: mail.logout()
+        except Exception: pass
+    return signals
+
+
+# ---------------------------------------------------------------------------
 # Form4 signals — read from local DB
 # ---------------------------------------------------------------------------
 
@@ -987,6 +1045,10 @@ def check_and_close_positions(account_id, dry_run, vix):
             hold_limit    = PEAD_HOLD_DAYS
             day_exit_lbl  = "DAY_28"
             breaker_val   = PEAD_BREAKER
+        elif pos_source == "THIRTEENF_BULL":
+            hold_limit    = THIRTEENF_HOLD_DAYS
+            day_exit_lbl  = "DAY_91"
+            breaker_val   = THIRTEENF_BREAKER
         else:
             hold_limit    = DIV_CUT_HOLD_DAYS
             day_exit_lbl  = "DAY_60"
@@ -1133,7 +1195,10 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
         lines.append(f"POSITIONS CLOSED TODAY ({closed_count}):")
         lines.append("-" * 50)
         for p in positions_closed:
-            reason_label = "Day 60 Exit" if p["close_reason"] == "DAY_60" else "CATASTROPHIC BREAKER"
+            reason_label = ("Day 28 Exit" if p["close_reason"] == "DAY_28"
+                else "Day 60 Exit" if p["close_reason"] == "DAY_60"
+                else "Day 91 Exit" if p["close_reason"] == "DAY_91"
+                else "CATASTROPHIC BREAKER")
             lines.append(
                 f"  SELL {p['ticker']:<8s} "
                 f"{p['shares']:>4d} shares | "
@@ -1240,6 +1305,7 @@ def run(dry_run=False, verbose=False):
     signals.extend(query_si_squeeze_signals_from_email(today_str))
     signals.extend(query_cot_signals_from_email(today_str))
     signals.extend(query_cel_signals_from_email(today_str))
+    signals.extend(query_13f_signals_from_email(today_str))
 
     if not signals:
         logger.info("No new signals tonight.")
@@ -1269,7 +1335,7 @@ def run(dry_run=False, verbose=False):
             already_open = set()
 
         pre_filter_count = len(signals)
-        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "SI_SQUEEZE", "COT_BULL", "COT_BEAR", "CEL_BEAR"}
+        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "SI_SQUEEZE", "COT_BULL", "COT_BEAR", "CEL_BEAR", "THIRTEENF_BULL"}
         signals = [
             s for s in signals
             if not (s["source"] in tracked_sources and s["ticker"] in already_open)
