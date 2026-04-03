@@ -108,37 +108,55 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def get_current_vix(timeout=30):
-    """Fetch current VIX level via yfinance. Returns None if fetch fails or times out."""
+    """Fetch VIX with fallback. Primary: yfinance. Fallback: direct Yahoo Finance HTTP.
+    Returns None only if both sources fail — caller must fail safe on None.
+    """
     import threading
-    result = [None]
-    error = [None]
 
-    def _fetch():
+    # --- Primary: yfinance with hard timeout ---
+    result = [None]
+    yf_error = [None]
+
+    def _fetch_yfinance():
         try:
             import pandas
-            vix = yf.Ticker("^VIX")
-            hist = vix.history(period="1d")
+            ticker = yf.Ticker("^VIX")
+            hist = ticker.history(period="1d")
             if not hist.empty:
                 if isinstance(hist.columns, pandas.MultiIndex):
                     hist.columns = [c[0] for c in hist.columns]
                 result[0] = float(hist["Close"].iloc[-1])
         except Exception as e:
-            error[0] = e
+            yf_error[0] = e
 
-    t = threading.Thread(target=_fetch, daemon=True)
+    t = threading.Thread(target=_fetch_yfinance, daemon=True)
     t.start()
     t.join(timeout=timeout)
 
-    if t.is_alive():
-        logger.error(f"VIX fetch timed out after {timeout}s")
-        return None
-    if error[0] is not None:
-        logger.error(f"VIX fetch failed: {error[0]}")
-        return None
     if result[0] is not None:
-        logger.info(f"VIX: {result[0]:.2f}")
+        logger.info(f"VIX: {result[0]:.2f} (yfinance)")
         return result[0]
-    logger.error("VIX fetch returned empty data")
+
+    if t.is_alive():
+        logger.warning(f"VIX yfinance timed out after {timeout}s — trying fallback")
+    else:
+        logger.warning(f"VIX yfinance failed ({yf_error[0]}) — trying fallback")
+
+    # --- Fallback: direct Yahoo Finance HTTP (bypasses yfinance library) ---
+    try:
+        import requests as req
+        r = req.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+        logger.info(f"VIX: {price:.2f} (Yahoo direct fallback)")
+        return price
+    except Exception as e:
+        logger.error(f"VIX fallback also failed: {e}")
+
+    logger.error("VIX fetch failed on both sources — fail-safe will block new entries")
     return None
 
 
