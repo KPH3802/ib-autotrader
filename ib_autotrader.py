@@ -246,10 +246,10 @@ def query_8k_signals_from_email(today_str):
         msg_ids = data[0].split() if data[0] else []
 
         if not msg_ids:
-            logger.info("No 8-K SHORT email today — checking last 7 days")
-            week_ago = (dt - timedelta(days=7)).strftime("%d-%b-%Y")
+            logger.info("No 8-K SHORT email today — checking last 4 days")
+            four_days_ago = (dt - timedelta(days=4)).strftime("%d-%b-%Y")
             typ, data = mail.search(None,
-                f'(SUBJECT "8-K SHORT:" SINCE "{week_ago}")')
+                f'(SUBJECT "8-K SHORT:" SINCE "{four_days_ago}")')
             msg_ids = data[0].split() if data[0] else []
 
         if not msg_ids:
@@ -1307,6 +1307,17 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
 # Main execution
 # ---------------------------------------------------------------------------
 
+def is_nyse_open_today():
+    """Return True if NYSE open today. Fails open if calendar unavailable."""
+    try:
+        import exchange_calendars as xcals
+        nyse = xcals.get_calendar("XNYS")
+        return nyse.is_session(date.today().isoformat())
+    except Exception as e:
+        logger.warning(f"NYSE calendar check failed ({e}) -- assuming market open")
+        return True
+
+
 def run(dry_run=False, verbose=False):
     """Main execution flow."""
     today_str = date.today().isoformat()
@@ -1314,6 +1325,12 @@ def run(dry_run=False, verbose=False):
     logger.info(f"IB AUTO-TRADER — {'DRY RUN' if dry_run else 'LIVE'}")
     logger.info(f"Date: {today_str}")
     logger.info("=" * 60)
+
+    # Step 0: NYSE market holiday check
+    if not is_nyse_open_today():
+        logger.info(f"NYSE CLOSED today ({today_str}) -- market holiday. Skipping execution.")
+        logger.info("Signals re-evaluated next trading day via normal lookback window.")
+        return
 
     # Step 1: Init positions DB
     init_positions_db()
