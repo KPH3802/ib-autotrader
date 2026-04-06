@@ -642,7 +642,7 @@ def query_cot_signals_from_email(today_str):
                         signals.append({'source':'COT_BEAR','ticker':t,'direction':'SHORT',
                                         'score':3,'price':None,'company':'','sector':'',
                                         'detail':'COT commercial extreme short signal'})
-        logger.info(f'COT signals: {len([s for s in signals if s[chr(34)+"direction"+chr(34)]=="BUY"])} BULL, {len([s for s in signals if s[chr(34)+"direction"+chr(34)]=="SHORT"])} BEAR')
+        logger.info(f'COT signals: {len([s for s in signals if s["direction"]=="BUY"])} BULL, {len([s for s in signals if s["direction"]=="SHORT"])} BEAR')
     except Exception as e:
         logger.error(f'COT email parse failed: {e}')
     finally:
