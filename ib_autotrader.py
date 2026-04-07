@@ -67,9 +67,10 @@ except ImportError:
 # Pull settings from config
 IB_GATEWAY_URL = config.IB_GATEWAY_URL
 IB_ACCOUNT_ID = getattr(config, "IB_ACCOUNT_ID", "")
-FULL_SIZE = config.FULL_POSITION_SIZE
-HALF_SIZE = config.HALF_POSITION_SIZE
-VIX_KILL = config.VIX_KILL_SWITCH
+SCORE_PCT      = getattr(config, "SCORE_PCT", {2: 0.03, 3: 0.05, 4: 0.08, 5: 0.08})
+VIX_WARN       = getattr(config, "VIX_WARN", 25)
+MAX_TOTAL_OPEN = getattr(config, "MAX_TOTAL_OPEN_POSITIONS", 20)
+VIX_KILL   = config.VIX_KILL_SWITCH
 MAX_ORDERS = config.MAX_POSITIONS_PER_RUN
 
 FORM4_DB = SCRIPT_DIR / config.FORM4_DB
@@ -184,6 +185,7 @@ def get_current_vix(timeout=30):
         logger.error(f"VIX FMP fallback failed: {e}")
 
     logger.error("VIX fetch failed on all 3 sources (yfinance, Yahoo direct, FMP) — fail-safe will block new entries")
+    send_twilio_sms("[GMC ALERT] VIX fetch failed all 3 sources. New entries blocked.")
     return None
 
 
@@ -199,6 +201,7 @@ def _connect_gmail():
         return mail
     except Exception as e:
         logger.error(f"Gmail IMAP login failed: {e}")
+        send_twilio_sms("[GMC ALERT] Gmail IMAP login failed. All signals unavailable.")
         return None
 
 
@@ -933,16 +936,16 @@ def fetch_live_price(ticker):
 # Position sizing
 # ---------------------------------------------------------------------------
 
-def calculate_shares(signal, live_price):
-    """
-    Calculate number of shares based on playbook rules.
-    Score 2 = half size, Score 3+ = full size.
-    """
+def calculate_shares(signal, live_price, account_value, vix=None):
+    """Calculate shares as % of account. Half-size when VIX >= VIX_WARN."""
     price = live_price or signal.get("price")
     if not price or price <= 0:
         return 0, 0.0
-
-    size = FULL_SIZE if signal["score"] >= 3 else HALF_SIZE
+    pct = SCORE_PCT.get(signal["score"], SCORE_PCT.get(3, 0.05))
+    if vix and vix >= VIX_WARN:
+        pct = pct / 2
+        logger.info(f"VIX {vix:.1f} >= {VIX_WARN} -- half-sizing to {pct*100:.1f}%")
+    size = round(account_value * pct, 2)
     shares = int(size / price)
     return max(shares, 1), size
 
@@ -1282,6 +1285,31 @@ def log_trade(signal, shares, size, status, order_id=None, vix=None):
 
 
 # ---------------------------------------------------------------------------
+# Twilio SMS critical alerts
+# ---------------------------------------------------------------------------
+def send_twilio_sms(message):
+    """Send SMS via Twilio REST API. Fails silently if not configured."""
+    sid   = getattr(config, 'TWILIO_ACCOUNT_SID', '')
+    token = getattr(config, 'TWILIO_AUTH_TOKEN', '')
+    frm   = getattr(config, 'TWILIO_FROM_NUMBER', '')
+    to    = getattr(config, 'TWILIO_TO_NUMBER', '')
+    if not all([sid, token, frm, to]):
+        logger.warning('Twilio not configured -- SMS skipped')
+        return
+    try:
+        url = f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json'
+        resp = requests.post(url, auth=(sid, token),
+                             data={'From': frm, 'To': to, 'Body': message},
+                             timeout=10)
+        if resp.status_code == 201:
+            logger.info(f'Twilio SMS sent: {message[:60]}')
+        else:
+            logger.error(f'Twilio SMS failed {resp.status_code}: {resp.text[:100]}')
+    except Exception as e:
+        logger.error(f'Twilio SMS exception: {e}')
+
+
+# ---------------------------------------------------------------------------
 # Holiday notification email
 # ---------------------------------------------------------------------------
 def send_holiday_email(today_str, dry_run=False):
@@ -1456,6 +1484,7 @@ def run(dry_run=False, verbose=False):
     if not dry_run:
         if not check_ib_connection():
             logger.error("Cannot connect to IB Gateway. Aborting.")
+            send_twilio_sms("[GMC ALERT] IB Gateway unreachable. Live orders cannot execute.")
             send_summary_email([], [], vix, dry_run)
             return
 
@@ -1522,6 +1551,28 @@ def run(dry_run=False, verbose=False):
         if filtered > 0:
             logger.info(f"Filtered {filtered} div cut signal(s) — positions already open")
 
+    # Fetch account value once for % sizing
+    account_value = get_event_alpha_account_value()
+    logger.info(f"Sizing account value: ${account_value:,.2f}")
+
+    # MAX_TOTAL_OPEN positions cap
+    current_open = 0
+    if POSITIONS_DB.exists():
+        try:
+            _conn = sqlite3.connect(str(POSITIONS_DB))
+            _c = _conn.cursor()
+            _c.execute("SELECT COUNT(*) FROM open_positions WHERE status='OPEN'")
+            current_open = _c.fetchone()[0]
+            _conn.close()
+        except Exception:
+            current_open = 0
+    slots_available = MAX_TOTAL_OPEN - current_open
+    if slots_available <= 0:
+        logger.warning(f"MAX_TOTAL_OPEN ({MAX_TOTAL_OPEN}) reached -- skipping new entries")
+        send_summary_email([], signals, vix, dry_run, positions_closed)
+        return
+    logger.info(f"Open: {current_open}/{MAX_TOTAL_OPEN} -- {slots_available} slot(s) available")
+
     # Step 6: Process each signal
     executed = []
     skipped = []
@@ -1555,7 +1606,7 @@ def run(dry_run=False, verbose=False):
         signal["live_price"] = live_price
 
         # Position sizing
-        shares, size = calculate_shares(signal, live_price)
+        shares, size = calculate_shares(signal, live_price, account_value, vix=vix)
         if shares <= 0:
             signal["skip_reason"] = "Zero shares"
             skipped.append(signal)

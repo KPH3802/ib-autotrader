@@ -42,3 +42,17 @@ FORM4_DB = "../form4_scanner/form4_insider_trades.db"
 # ---------------------------------------------------------------------------
 TRADE_LOG_PATH = "trade_log.csv"
 POSITIONS_DB = "positions.db"    # Tracks open div cut positions for exit management
+
+# Twilio SMS alerts (critical failure notifications)
+TWILIO_ACCOUNT_SID = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # From Twilio console
+TWILIO_AUTH_TOKEN  = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # From Twilio console
+TWILIO_FROM_NUMBER = "+1XXXXXXXXXX"  # Your Twilio number
+TWILIO_TO_NUMBER   = "+1XXXXXXXXXX"  # Your cell number
+
+# ---------------------------------------------------------------------------
+# Path A: Percentage-based position sizing
+# ---------------------------------------------------------------------------
+SCORE_PCT = {2: 0.03, 3: 0.05, 4: 0.08, 5: 0.08}
+VIX_WARN  = 25
+MAX_TOTAL_OPEN_POSITIONS = 20
+EVENT_ALPHA_ACCOUNT_VALUE = 10000  # Fallback if IB Gateway unavailable
