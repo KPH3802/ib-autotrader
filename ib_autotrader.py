@@ -1496,7 +1496,7 @@ def run(dry_run=False, verbose=False):
             already_open = set()
 
         pre_filter_count = len(signals)
-        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "SI_SQUEEZE", "COT_BULL", "COT_BEAR", "CEL_BEAR", "THIRTEENF_BULL"}
+        tracked_sources = {"DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "8K_1.01", "SI_SQUEEZE", "COT_BULL", "COT_BEAR", "CEL_BEAR", "THIRTEENF_BULL"}
         signals = [
             s for s in signals
             if not (s["source"] in tracked_sources and s["ticker"] in already_open)
@@ -1559,7 +1559,7 @@ def run(dry_run=False, verbose=False):
         if dry_run:
             log_trade(signal, shares, size, "DRY_RUN", vix=vix)
             # Log tracked-source entries to positions DB even in dry-run
-            if signal["source"] in ("DIV_CUT", "PEAD_BULL", "PEAD_BEAR"):
+            if signal["source"] in ("DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "8K_1.01", "SI_SQUEEZE", "COT_BULL", "COT_BEAR", "CEL_BEAR", "THIRTEENF_BULL"):
                 log_position_entry(
                     ticker=ticker,
                     entry_date=today_str,
@@ -1588,7 +1588,7 @@ def run(dry_run=False, verbose=False):
             logger.info(f"  ORDER PLACED: {side} {shares} {ticker} — ID {order_id}")
             log_trade(signal, shares, size, "FILLED", order_id=order_id, vix=vix)
             # Log tracked-source entries to positions tracker
-            if signal["source"] in ("DIV_CUT", "PEAD_BULL", "PEAD_BEAR"):
+            if signal["source"] in ("DIV_CUT", "PEAD_BULL", "PEAD_BEAR", "8K_1.01", "SI_SQUEEZE", "COT_BULL", "COT_BEAR", "CEL_BEAR", "THIRTEENF_BULL"):
                 log_position_entry(
                     ticker=ticker,
                     entry_date=today_str,
