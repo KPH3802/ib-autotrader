@@ -1194,9 +1194,11 @@ def check_and_close_positions(account_id, dry_run, vix):
         if days_held >= hold_limit:
             close_reason = day_exit_lbl
             logger.info(f"  {ticker}: {day_exit_lbl} exit triggered ({days_held} days held)")
+            send_twilio_sms(f"[GMC EXIT] {ticker} {day_exit_lbl}: {return_pct:+.1f}% return after {days_held}d held")
         elif return_pct <= breaker_val:
             close_reason = "CATASTROPHIC_BREAKER"
             logger.warning(f"  {ticker}: CATASTROPHIC BREAKER triggered ({return_pct:.1f}%)")
+            send_twilio_sms(f"[GMC BREAKER] {ticker} CATASTROPHIC BREAKER: {return_pct:.1f}% return. Position closing.")
 
         if close_reason is None:
             continue
@@ -1432,6 +1434,33 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
 
 
 # ---------------------------------------------------------------------------
+# positions.db backup to PythonAnywhere
+# ---------------------------------------------------------------------------
+def backup_positions_db_to_pa():
+    """Upload positions.db to PythonAnywhere after each run. Fails silently."""
+    token    = getattr(config, "PA_API_TOKEN", "")
+    username = getattr(config, "PA_USERNAME", "KPH3802")
+    if not token:
+        logger.warning("PA backup skipped -- PA_API_TOKEN not configured")
+        return
+    if not POSITIONS_DB.exists():
+        return
+    try:
+        url = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path/home/{username}/positions_db_backup/positions.db"
+        with open(POSITIONS_DB, "rb") as fh:
+            resp = requests.post(url,
+                headers={"Authorization": f"Token {token}"},
+                files={"content": fh},
+                timeout=30)
+        if resp.status_code in (200, 201):
+            logger.info("positions.db backed up to PythonAnywhere")
+        else:
+            logger.error(f"PA backup failed {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        logger.error(f"PA backup exception: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Main execution
 # ---------------------------------------------------------------------------
 
@@ -1554,6 +1583,11 @@ def run(dry_run=False, verbose=False):
     # Fetch account value once for % sizing
     account_value = get_event_alpha_account_value()
     logger.info(f"Sizing account value: ${account_value:,.2f}")
+
+    # Daily loss limit check (two-tier)
+    if check_daily_loss_limit(account_value):
+        send_summary_email([], signals, vix, dry_run, positions_closed)
+        return
 
     # MAX_TOTAL_OPEN positions cap
     current_open = 0
@@ -1683,6 +1717,7 @@ def run(dry_run=False, verbose=False):
     logger.info("=" * 60)
 
     send_summary_email(executed, skipped, vix, dry_run, positions_closed)
+    backup_positions_db_to_pa()
 
 
 # ---------------------------------------------------------------------------

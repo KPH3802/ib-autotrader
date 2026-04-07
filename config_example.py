@@ -56,3 +56,11 @@ SCORE_PCT = {2: 0.03, 3: 0.05, 4: 0.08, 5: 0.08}
 VIX_WARN  = 25
 MAX_TOTAL_OPEN_POSITIONS = 20
 EVENT_ALPHA_ACCOUNT_VALUE = 10000  # Fallback if IB Gateway unavailable
+
+# PythonAnywhere API (for positions.db backup)
+PA_API_TOKEN = "your_pa_api_token"
+PA_USERNAME  = "KPH3802"
+
+# Daily loss limits (two-tier)
+LOSS_WARN_PCT = 0.15
+LOSS_HALT_PCT = 0.08
