@@ -70,6 +70,9 @@ IB_ACCOUNT_ID = getattr(config, "IB_ACCOUNT_ID", "")
 SCORE_PCT      = getattr(config, "SCORE_PCT", {2: 0.03, 3: 0.05, 4: 0.08, 5: 0.08})
 VIX_WARN       = getattr(config, "VIX_WARN", 25)
 MAX_TOTAL_OPEN = getattr(config, "MAX_TOTAL_OPEN_POSITIONS", 20)
+LOSS_WARN_PCT  = getattr(config, "LOSS_WARN_PCT", 0.15)
+LOSS_HALT_PCT  = getattr(config, "LOSS_HALT_PCT", 0.08)
+LOSS_HALT_FLAG = SCRIPT_DIR / "loss_limit_halt.flag"
 VIX_KILL   = config.VIX_KILL_SWITCH
 MAX_ORDERS = config.MAX_POSITIONS_PER_RUN
 
