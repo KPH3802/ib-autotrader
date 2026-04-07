@@ -91,6 +91,14 @@ THIRTEENF_HOLD_DAYS     = 91     # 13-week hold (matches backtest)
 THIRTEENF_BREAKER       = -39.9  # Catastrophic circuit breaker
 THIRTEENF_LOOKBACK_DAYS = 7      # Check last 7 days (scanner fires quarterly)
 
+# 8-K Item 1.01 signal settings
+EIGHT_K_HOLD_DAYS  = 5       # 5-day hold (validated window in backtest, t=-9.98)
+EIGHT_K_BREAKER   = -39.9   # Catastrophic circuit breaker (% return)
+
+# Form4 signal settings
+F4_HOLD_DAYS  = 5       # 5-day hold (validated window in backtest)
+F4_BREAKER    = -39.9   # Catastrophic circuit breaker (% return)
+
 # Gmail IMAP settings (same credentials as outbound email)
 IMAP_SERVER = "imap.gmail.com"
 IMAP_PORT = 993
@@ -1149,6 +1157,14 @@ def check_and_close_positions(account_id, dry_run, vix):
             hold_limit    = THIRTEENF_HOLD_DAYS
             day_exit_lbl  = "DAY_91"
             breaker_val   = THIRTEENF_BREAKER
+        elif pos_source == "8K_1.01":
+            hold_limit    = EIGHT_K_HOLD_DAYS
+            day_exit_lbl  = "DAY_5"
+            breaker_val   = EIGHT_K_BREAKER
+        elif pos_source.startswith("F4_"):
+            hold_limit    = F4_HOLD_DAYS
+            day_exit_lbl  = "DAY_5"
+            breaker_val   = F4_BREAKER
         else:
             hold_limit    = DIV_CUT_HOLD_DAYS
             day_exit_lbl  = "DAY_60"
@@ -1323,7 +1339,8 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
         lines.append(f"POSITIONS CLOSED TODAY ({closed_count}):")
         lines.append("-" * 50)
         for p in positions_closed:
-            reason_label = ("Day 28 Exit" if p["close_reason"] == "DAY_28"
+            reason_label = ("Day 5 Exit" if p["close_reason"] == "DAY_5"
+                else "Day 28 Exit" if p["close_reason"] == "DAY_28"
                 else "Day 60 Exit" if p["close_reason"] == "DAY_60"
                 else "Day 91 Exit" if p["close_reason"] == "DAY_91"
                 else "CATASTROPHIC BREAKER")
