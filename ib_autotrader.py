@@ -1435,6 +1435,61 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
     except Exception as e:
         logger.error(f"Email failed: {e}")
 
+# ---------------------------------------------------------------------------
+# Scanner watchdog -- PA health check
+# ---------------------------------------------------------------------------
+
+WATCHDOG_SCANNERS = [
+    {
+        "name":             "Form4 Scanner",
+        "subject_fragment": "Form 4 Scanner Status",
+        "max_silence_days": 4,
+    },
+    {
+        "name":             "8-K Scanner",
+        "subject_fragment": "8-K SHORT:",
+        "max_silence_days": 7,
+    },
+]
+
+def check_scanner_watchdog():
+    """Check Gmail for scanner heartbeat emails. Fires Twilio SMS if stale."""
+    mail = _connect_gmail()
+    if not mail:
+        logger.warning("Watchdog: Gmail unavailable -- skipping scanner health check")
+        return
+    today = date.today()
+    alerts_fired = []
+    try:
+        mail.select("INBOX")
+        for scanner in WATCHDOG_SCANNERS:
+            name     = scanner["name"]
+            fragment = scanner["subject_fragment"]
+            max_days = scanner["max_silence_days"]
+            lookback = max_days + 1
+            since_str = (today - timedelta(days=lookback)).strftime("%d-%b-%Y")
+            q = "(SUBJECT " + chr(34) + fragment + chr(34) + " SINCE " + chr(34) + since_str + chr(34) + ")"
+            typ, data = mail.search(None, q)
+            msg_ids = data[0].split() if data[0] else []
+            if not msg_ids:
+                sms = "[GMC WATCHDOG] " + name + " email missing " + str(max_days) + "+ days. Check PythonAnywhere (" + fragment + ")."
+                logger.warning("WATCHDOG ALERT: " + name + " silent " + str(max_days) + "+ days")
+                system_warnings.append("WARNING: " + name + " silent " + str(max_days) + "+ days -- PA task may be down")
+                send_twilio_sms(sms)
+                alerts_fired.append(name)
+            else:
+                logger.info("Watchdog OK: " + name + " (" + str(len(msg_ids)) + " email(s) in last " + str(lookback) + " days)")
+    except Exception as e:
+        logger.error("Watchdog check failed: " + str(e))
+    finally:
+        try: mail.logout()
+        except Exception: pass
+    if not alerts_fired:
+        logger.info("Scanner watchdog: all monitored scanners healthy")
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # positions.db backup to PythonAnywhere
@@ -1498,6 +1553,9 @@ def run(dry_run=False, verbose=False):
 
     # Step 1: Init positions DB
     init_positions_db()
+
+    # Step 1b: Scanner watchdog -- PA health check
+    check_scanner_watchdog()
 
     # Step 2: VIX check
     vix = get_current_vix()
