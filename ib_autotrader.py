@@ -1322,7 +1322,8 @@ def send_twilio_sms(message):
         return
     try:
         url = f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json'
-        resp = requests.post(url, auth=(sid, token),
+        api_key = getattr(config, "TWILIO_API_KEY_SID", "") or sid
+        resp = requests.post(url, auth=(api_key, token),
                              data={'From': frm, 'To': to, 'Body': message},
                              timeout=10)
         if resp.status_code == 201:
