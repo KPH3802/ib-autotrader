@@ -488,18 +488,27 @@ def query_div_cut_signals(today_str):
 def _parse_pead_subject(subject):
     import re
     results = []
-    bull = re.search(r'PEAD BULL:\s*([A-Z ,]+?)(?:\s*\||$)', subject)
+    bull = re.search(r'PEAD BULL:\s*([A-Z0-9:, ]+?)(?:\s*\||$)', subject)
     if bull:
-        for t in bull.group(1).split(','):
-            t = t.strip()
-            if t: results.append((t, 'BUY'))
-    bear = re.search(r'PEAD BEAR:\s*([A-Z ,]+?)(?:\s*\||$)', subject)
+        for item in bull.group(1).split(','):
+            item = item.strip()
+            if ':' in item:
+                ticker, sc = item.split(':', 1)
+                score = int(sc) if sc.strip().isdigit() else 3
+            else:
+                ticker, score = item, 3
+            if ticker.strip(): results.append((ticker.strip(), 'BUY', score))
+    bear = re.search(r'PEAD BEAR:\s*([A-Z0-9:, ]+?)(?:\s*\||$)', subject)
     if bear:
-        for t in bear.group(1).split(','):
-            t = t.strip()
-            if t: results.append((t, 'SHORT'))
+        for item in bear.group(1).split(','):
+            item = item.strip()
+            if ':' in item:
+                ticker, sc = item.split(':', 1)
+                score = int(sc) if sc.strip().isdigit() else 2
+            else:
+                ticker, score = item, 2
+            if ticker.strip(): results.append((ticker.strip(), 'SHORT', score))
     return results
-
 
 def query_pead_signals_from_email(today_str):
     """Parse PEAD BULL/BEAR signals from Gmail. BULL->BUY, BEAR->SHORT, score=3 (full size)."""
@@ -527,14 +536,14 @@ def query_pead_signals_from_email(today_str):
             logger.info(f"PEAD email: '{subj}'")
             if 'PEAD BULL:' not in subj and 'PEAD BEAR:' not in subj:
                 continue
-            for ticker, direction in _parse_pead_subject(subj):
+            for ticker, direction, score in _parse_pead_subject(subj):
                 key = (ticker, direction)
                 if key not in seen:
                     seen.add(key)
                     src_name = 'PEAD_BULL' if direction == 'BUY' else 'PEAD_BEAR'
                     signals.append({
                         'source': src_name, 'ticker': ticker,
-                        'direction': direction, 'score': 3,
+                        'direction': direction, 'score': score,  # Path B: magnitude from email subject
                         'price': None, 'company': '', 'sector': '',
                         'detail': f"PEAD {'beat' if direction=='BUY' else 'miss'} >=5% EPS surprise",
                     })
