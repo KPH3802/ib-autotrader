@@ -73,6 +73,7 @@ MAX_TOTAL_OPEN = getattr(config, "MAX_TOTAL_OPEN_POSITIONS", 20)
 LOSS_WARN_PCT  = getattr(config, "LOSS_WARN_PCT", 0.15)
 LOSS_HALT_PCT  = getattr(config, "LOSS_HALT_PCT", 0.08)
 LOSS_HALT_FLAG = SCRIPT_DIR / "loss_limit_halt.flag"
+EVENT_ALPHA_ACCOUNT_VALUE = getattr(config, "EVENT_ALPHA_ACCOUNT_VALUE", 10000)
 VIX_KILL   = config.VIX_KILL_SWITCH
 MAX_ORDERS = config.MAX_POSITIONS_PER_RUN
 
@@ -1005,6 +1006,24 @@ def get_account_id():
     return None
 
 
+def get_event_alpha_account_value():
+    '''Fetch Event Alpha account net liquidation value from IB Gateway.
+    Falls back to EVENT_ALPHA_ACCOUNT_VALUE config constant if IB unreachable.'''
+    try:
+        acct_id = IB_ACCOUNT_ID or get_account_id()
+        if acct_id:
+            result = ib_request('GET', f'/portfolio/{acct_id}/summary')
+            if result:
+                nlv = result.get('netliquidation', {}).get('amount')
+                if nlv and float(nlv) > 0:
+                    logger.info(f'Account value from IB Gateway: \${float(nlv):,.2f}')
+                    return float(nlv)
+    except Exception as e:
+        logger.warning(f'Could not fetch account value from IB: {e}')
+    logger.info(f'Using config fallback account value: \${EVENT_ALPHA_ACCOUNT_VALUE:,}')
+    return float(EVENT_ALPHA_ACCOUNT_VALUE)
+
+
 def search_contract(ticker):
     """Search for a stock contract ID (conid) by ticker symbol."""
     result = ib_request("GET", f"/iserver/secdef/search?symbol={ticker}")
@@ -1516,6 +1535,68 @@ def backup_positions_db_to_pa():
             logger.error(f"PA backup failed {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
         logger.error(f"PA backup exception: {e}")
+
+
+
+
+def check_daily_loss_limit(account_value):
+    """Two-tier daily loss limit check.
+    Tier1: unrealized loss >LOSS_WARN_PCT of deployed -> email warning.
+    Tier2: unrealized loss >LOSS_HALT_PCT of account -> SMS + flag + halt.
+    Returns True if halted, False otherwise.
+    """
+    if LOSS_HALT_FLAG.exists():
+        logger.warning("LOSS LIMIT HALT ACTIVE -- loss_limit_halt.flag present")
+        system_warnings.append("DAILY LOSS LIMIT HALT: delete loss_limit_halt.flag to resume.")
+        return True
+    if not POSITIONS_DB.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(POSITIONS_DB))
+        c = conn.cursor()
+        c.execute("SELECT ticker, direction, entry_price, shares, position_size FROM open_positions WHERE status='OPEN'")
+        rows = c.fetchall()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Loss limit check failed: {e}")
+        return False
+    if not rows:
+        return False
+    total_deployed = 0.0
+    total_unrealized = 0.0
+    for ticker, direction, entry_price, shares, position_size in rows:
+        total_deployed += float(position_size or 0)
+        try:
+            current_price = fetch_live_price(ticker)
+            if current_price is None:
+                continue
+            current_price = float(current_price)
+            if direction == "SHORT":
+                pnl = (entry_price - current_price) * shares
+            else:
+                pnl = (current_price - entry_price) * shares
+            total_unrealized += pnl
+        except Exception:
+            continue
+    if total_unrealized >= 0 or total_deployed == 0:
+        return False
+    loss_pct_deployed = abs(total_unrealized) / total_deployed if total_deployed > 0 else 0
+    loss_pct_account  = abs(total_unrealized) / account_value  if account_value > 0 else 0
+    logger.info(f"Daily loss check: unrealized={total_unrealized:+,.2f} | {loss_pct_deployed:.1%} deployed | {loss_pct_account:.1%} account")
+    if loss_pct_account >= LOSS_HALT_PCT:
+        msg = f"[GMC HALT] Daily loss {total_unrealized:+,.0f} ({loss_pct_account:.1%} of account). Entries halted."
+        logger.warning(msg)
+        send_twilio_sms(msg)
+        try:
+            LOSS_HALT_FLAG.write_text(f"Halted {date.today().isoformat()}: {total_unrealized:+,.0f}")
+        except Exception as e:
+            logger.error(f"Could not write halt flag: {e}")
+        system_warnings.append(f"DAILY LOSS HALT: {total_unrealized:+,.0f} ({loss_pct_account:.1%} of account)")
+        return True
+    if loss_pct_deployed >= LOSS_WARN_PCT:
+        system_warnings.append(f"DAILY LOSS WARNING: {total_unrealized:+,.0f} ({loss_pct_deployed:.1%} of deployed)")
+        logger.warning(f"Loss warning: {total_unrealized:+,.0f} = {loss_pct_deployed:.1%} of deployed")
+    return False
 
 
 # ---------------------------------------------------------------------------
