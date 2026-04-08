@@ -1470,6 +1470,31 @@ WATCHDOG_SCANNERS = [
         "subject_fragment": "8-K SHORT:",
         "max_silence_days": 7,
     },
+    {
+        "name":             "PEAD Scanner",
+        "subject_fragment": "PEAD Scanner",
+        "max_silence_days": 2,
+    },
+    {
+        "name":             "SI Scanner",
+        "subject_fragment": "SI Scanner",
+        "max_silence_days": 2,
+    },
+    {
+        "name":             "COT Scanner",
+        "subject_fragment": "COT Scanner",
+        "max_silence_days": 8,
+    },
+    {
+        "name":             "CEL Scanner",
+        "subject_fragment": "CEL Scanner",
+        "max_silence_days": 2,
+    },
+    {
+        "name":             "13F Scanner",
+        "subject_fragment": "13F Scanner",
+        "max_silence_days": 2,
+    },
 ]
 
 def check_scanner_watchdog():
