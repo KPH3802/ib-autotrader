@@ -1019,6 +1019,8 @@ def get_event_alpha_account_value():
     '''Fetch Event Alpha account net liquidation value from IB Gateway.
     Falls back to EVENT_ALPHA_ACCOUNT_VALUE config constant if IB unreachable.'''
     try:
+        # Tickle the session to ensure portfolio API responds
+        ib_request('POST', '/tickle')
         acct_id = IB_ACCOUNT_ID or get_account_id()
         if acct_id:
             result = ib_request('GET', f'/portfolio/{acct_id}/summary')
@@ -1321,26 +1323,24 @@ def log_trade(signal, shares, size, status, order_id=None, vix=None):
 # Twilio SMS critical alerts
 # ---------------------------------------------------------------------------
 def send_twilio_sms(message):
-    """Send SMS via Twilio REST API. Fails silently if not configured."""
-    sid   = getattr(config, 'TWILIO_ACCOUNT_SID', '')
-    token = getattr(config, 'TWILIO_AUTH_TOKEN', '')
-    frm   = getattr(config, 'TWILIO_FROM_NUMBER', '')
-    to    = getattr(config, 'TWILIO_TO_NUMBER', '')
-    if not all([sid, token, frm, to]):
-        logger.warning('Twilio not configured -- SMS skipped')
+    """Send SMS via Telnyx REST API. Fails silently if not configured."""
+    api_key = getattr(config, 'TELNYX_API_KEY', '')
+    frm     = getattr(config, 'TELNYX_FROM_NUMBER', '')
+    to      = getattr(config, 'TELNYX_TO_NUMBER', '')
+    if not all([api_key, frm, to]):
+        logger.warning('Telnyx not configured -- SMS skipped')
         return
     try:
-        url = f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json'
-        api_key = getattr(config, "TWILIO_API_KEY_SID", "") or sid
-        resp = requests.post(url, auth=(api_key, token),
-                             data={'From': frm, 'To': to, 'Body': message},
-                             timeout=10)
-        if resp.status_code == 201:
-            logger.info(f'Twilio SMS sent: {message[:60]}')
+        url  = 'https://api.telnyx.com/v2/messages'
+        hdrs = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+        payload = {'from': frm, 'to': to, 'text': message}
+        resp = requests.post(url, headers=hdrs, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logger.info(f'Telnyx SMS sent: {message[:60]}')
         else:
-            logger.error(f'Twilio SMS failed {resp.status_code}: {resp.text[:100]}')
+            logger.error(f'Telnyx SMS failed {resp.status_code}: {resp.text[:100]}')
     except Exception as e:
-        logger.error(f'Twilio SMS exception: {e}')
+        logger.error(f'Telnyx SMS exception: {e}')
 
 
 # ---------------------------------------------------------------------------
