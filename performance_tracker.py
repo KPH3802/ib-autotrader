@@ -34,8 +34,11 @@ import config
 NEWS_DIGEST_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "news_digest")
 sys.path.insert(0, NEWS_DIGEST_DIR)
 try:
-    import config as nd_config
-except ImportError:
+    import importlib.util as _ilu
+    _nd_spec = _ilu.spec_from_file_location("nd_config", os.path.join(NEWS_DIGEST_DIR, "config.py"))
+    nd_config = _ilu.module_from_spec(_nd_spec)
+    _nd_spec.loader.exec_module(nd_config)
+except Exception:
     nd_config = None
 
 POSITIONS_DB = config.POSITIONS_DB
@@ -641,8 +644,9 @@ def build_digital_alpha(prices):
     # Get Coinbase portfolio value
     current_value, positions = get_crypto_portfolio_value()
 
-    return_dollar = round(current_value - DIGITAL_ALPHA_COST_BASIS, 2) if current_value is not None else None
-    return_pct = round(((current_value - DIGITAL_ALPHA_COST_BASIS) / DIGITAL_ALPHA_COST_BASIS) * 100, 2) if current_value is not None else None
+    _cv_valid = current_value is not None and current_value > 0
+    return_dollar = round(current_value - DIGITAL_ALPHA_COST_BASIS, 2) if _cv_valid else None
+    return_pct = round(((current_value - DIGITAL_ALPHA_COST_BASIS) / DIGITAL_ALPHA_COST_BASIS) * 100, 2) if _cv_valid else None
 
     return {
         "current_value": current_value,
