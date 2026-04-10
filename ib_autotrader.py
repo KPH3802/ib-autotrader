@@ -2111,6 +2111,12 @@ def run(dry_run=False, verbose=False):
             skipped.append(signal)
             continue
 
+        # Cap check -- re-evaluate remaining slots within this run
+        if slots_available <= 0:
+            signal["skip_reason"] = f"MAX_TOTAL_OPEN ({MAX_TOTAL_OPEN}) reached mid-run"
+            skipped.append(signal)
+            continue
+
         # M&A check — skip if acquisition/merger news detected
         ma_risk, ma_reason = check_ma_risk(ticker)
         if ma_risk:
@@ -2165,6 +2171,7 @@ def run(dry_run=False, verbose=False):
                 )
             executed.append(signal)
             order_count += 1
+            slots_available -= 1
             continue
 
         # Look up contract ID
@@ -2194,6 +2201,7 @@ def run(dry_run=False, verbose=False):
                 )
             executed.append(signal)
             order_count += 1
+            slots_available -= 1
         else:
             signal["skip_reason"] = "Order submission failed"
             skipped.append(signal)
