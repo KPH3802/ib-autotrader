@@ -201,7 +201,7 @@ def _connect_gmail():
     """Open authenticated Gmail IMAP connection. Returns mail object or None."""
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-        mail.login(config.EMAIL_SENDER, config.EMAIL_PASSWORD)
+        mail.login(getattr(config, "IMAP_USER", config.EMAIL_SENDER), getattr(config, "IMAP_PASSWORD", config.EMAIL_PASSWORD))
         return mail
     except Exception as e:
         logger.error(f"Gmail IMAP login failed: {e}")
