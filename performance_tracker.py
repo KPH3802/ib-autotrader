@@ -229,52 +229,43 @@ def fetch_historical_return_pct(ticker, from_date_str):
 # ---------------------------------------------------------------------------
 
 def get_crypto_portfolio_value():
-    """Get total Coinbase portfolio value in USD. Returns (value, positions_detail) or (None, [])."""
+    """Get total Coinbase portfolio value via portfolio breakdown endpoint.
+    USDC cash is in total_cash_equivalent_balance, not in get_accounts().
+    Returns (total_usd, positions_detail) or (None, []).
+    """
     if COINBASE_CDP_KEY is None:
         logger.warning("Coinbase CDP key not configured")
         return None, []
-
     try:
         from coinbase.rest import RESTClient
         key_path = os.path.join(NEWS_DIGEST_DIR, COINBASE_CDP_KEY)
         with open(key_path) as f:
             creds = json.load(f)
         client = RESTClient(api_key=creds["name"], api_secret=creds["privateKey"])
-        accounts = client.get_accounts()
-
-        total_usd = 0.0
+        # Step 1: get portfolio uuid
+        portfolios = client.get_portfolios()
+        port_list = portfolios.get("portfolios", []) if isinstance(portfolios, dict) else getattr(portfolios, "portfolios", [])
+        if not port_list:
+            logger.warning("No Coinbase portfolios found")
+            return None, []
+        uuid = port_list[0].get("uuid", "") if isinstance(port_list[0], dict) else getattr(port_list[0], "uuid", "")
+        # Step 2: breakdown endpoint -- cash (USDC) + crypto
+        breakdown = client.get(f"/api/v3/brokerage/portfolios/{uuid}")
+        balances = breakdown.get("breakdown", {}).get("portfolio_balances", {})
+        cash_val = float(balances.get("total_cash_equivalent_balance", {}).get("value", 0))
+        crypto_val = float(balances.get("total_crypto_balance", {}).get("value", 0))
+        total_usd = round(cash_val + crypto_val, 2)
+        # Step 3: positions detail
         positions = []
-        for acct in accounts.accounts:
-            ab = acct.available_balance
-            if isinstance(ab, dict):
-                balance = float(ab.get("value", 0))
-                currency = ab.get("currency", "")
-            else:
-                balance = float(getattr(ab, "value", 0))
-                currency = getattr(ab, "currency", "")
-
-            if balance <= 0.0001:
-                continue
-
-            if currency in ("USD", "USDC"):
-                total_usd += balance
-                positions.append({"currency": currency, "balance": balance, "usd_value": balance})
-            else:
-                # Get USD value
-                try:
-                    product_id = f"{currency}-USD"
-                    product = client.get_product(product_id)
-                    price = float(product.price) if hasattr(product, 'price') else None
-                    if price:
-                        usd_val = balance * price
-                        total_usd += usd_val
-                        positions.append({"currency": currency, "balance": balance,
-                                          "usd_value": round(usd_val, 2), "price": price})
-                except Exception:
-                    positions.append({"currency": currency, "balance": balance,
-                                      "usd_value": None})
-
-        return round(total_usd, 2), positions
+        for pos in breakdown.get("breakdown", {}).get("spot_positions", []):
+            asset = pos.get("asset", "")
+            fiat_val = float(pos.get("total_balance_fiat", 0))
+            crypto_bal = float(pos.get("total_balance_crypto", 0))
+            is_cash = pos.get("is_cash", False)
+            if fiat_val > 0.01 or is_cash:
+                positions.append({"currency": asset, "balance": crypto_bal,
+                                   "usd_value": round(fiat_val, 2), "is_cash": is_cash})
+        return total_usd, positions
     except Exception as e:
         logger.warning(f"Coinbase fetch failed: {e}")
         return None, []
