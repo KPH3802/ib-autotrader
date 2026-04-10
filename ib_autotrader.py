@@ -1111,6 +1111,26 @@ def init_positions_db():
             UNIQUE(ticker, entry_date)
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS capacity_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_date            TEXT NOT NULL,
+            blocked_ticker        TEXT NOT NULL,
+            blocked_source        TEXT,
+            blocked_score         INTEGER,
+            blocked_direction     TEXT,
+            blocked_adj_ev_pct    REAL,
+            open_ticker           TEXT NOT NULL,
+            open_source           TEXT,
+            open_entry_date       TEXT,
+            open_entry_price      REAL,
+            open_price_at_block   REAL,
+            open_unrealized_pct   REAL,
+            open_days_held        INTEGER,
+            open_days_remaining   INTEGER,
+            open_is_evictable     INTEGER
+        )
+    """)
     conn.commit()
     conn.close()
     logger.info(f"Positions DB ready: {POSITIONS_DB}")
@@ -1371,9 +1391,273 @@ def send_holiday_email(today_str, dry_run=False):
         logger.error(f"Holiday email failed: {e}")
 
 
+
 # ---------------------------------------------------------------------------
 # Email summary
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Signal metadata -- avg returns and hold days from Full 2025 backtest.
+# Used for capacity-hit analysis and missed-trade EV estimation.
+# Hold days: validated figures. SI/COT/CEL use 60d (exit default, Path B pending).
+# Protected signals must never be evicted -- exit rules are data-derived only.
+# Decision log: Apr 9 2026 -- measure first, automate later. See Master_status.md.
+# ---------------------------------------------------------------------------
+SIGNAL_METADATA = {
+    "8K_1.01":        {"avg_return": 3.17,  "hold_days": 5,  "protected": False},
+    "PEAD_BULL":      {"avg_return": 4.24,  "hold_days": 28, "protected": False},
+    "PEAD_BEAR":      {"avg_return": 1.74,  "hold_days": 28, "protected": False},
+    "SI_SQUEEZE":     {"avg_return": 1.70,  "hold_days": 60, "protected": False},
+    "COT_BULL":       {"avg_return": 0.75,  "hold_days": 60, "protected": False},
+    "COT_BEAR":       {"avg_return": 0.75,  "hold_days": 60, "protected": False},
+    "CEL_BEAR":       {"avg_return": 0.21,  "hold_days": 5,  "protected": False},
+    "THIRTEENF_BULL": {"avg_return": 9.97,  "hold_days": 91, "protected": True},
+    "DIV_CUT":        {"avg_return": 7.55,  "hold_days": 60, "protected": True},
+    "F4_BUY_CLUSTER": {"avg_return": 0.60,  "hold_days": 5,  "protected": False},
+    "F4_SELL_S1":     {"avg_return": 0.60,  "hold_days": 5,  "protected": False},
+    "F4_SELL_S2":     {"avg_return": 0.60,  "hold_days": 5,  "protected": False},
+}
+
+MISSED_TRADES_LOG = SCRIPT_DIR / "missed_trades.csv"
+
+
+def _incoming_ev(sig):
+    """Score-adjusted expected value for an incoming signal."""
+    meta = SIGNAL_METADATA.get(sig.get("source", ""), {})
+    base = meta.get("avg_return", 0.0)
+    score = sig.get("score", 3)
+    mult = 1.5 if score >= 4 else (1.0 if score >= 3 else 0.6)
+    return base * mult
+
+
+def _get_open_positions_for_cap():
+    """Return list of dicts for all OPEN positions enriched with hold metadata."""
+    if not POSITIONS_DB.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(POSITIONS_DB))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM open_positions WHERE status='OPEN'")
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+    except Exception:
+        return []
+    today = date.today()
+    for pos in rows:
+        try:
+            entry = date.fromisoformat(pos["entry_date"])
+        except Exception:
+            entry = today
+        pos["days_held"] = (today - entry).days
+        meta = SIGNAL_METADATA.get(pos.get("source", ""), {})
+        hold = meta.get("hold_days", 60)
+        pos["hold_days"]      = hold
+        pos["protected"]      = meta.get("protected", False)
+        pos["days_remaining"] = max(0, hold - pos["days_held"])
+        pos["pct_complete"]   = min(1.0, pos["days_held"] / hold) if hold > 0 else 1.0
+        # Remaining expected value: linear decay of avg_return over hold period
+        pos["rev"]            = meta.get("avg_return", 0.0) * (1.0 - pos["pct_complete"])
+    return rows
+
+
+def _analyze_eviction(incoming_signals, open_positions):
+    """
+    Observation-only: which open position WOULD be evicted under the simple rule?
+    Tier 1 evictable: days_remaining <= 2, not protected, pct_complete >= 0.30.
+    Returns (candidate_or_None, reason_str, best_incoming_or_None).
+    NO trades are placed or modified by this function.
+    """
+    best = max(incoming_signals, key=_incoming_ev) if incoming_signals else None
+    best_ev = _incoming_ev(best) if best else 0.0
+
+    candidates = [
+        p for p in open_positions
+        if not p["protected"]
+        and p["pct_complete"] >= 0.30
+        and p["days_remaining"] <= 2
+    ]
+    if not candidates:
+        return None, "No positions qualify under tier rules (none in final 2 days, non-protected, >=30% complete)", best
+
+    weakest = min(candidates, key=lambda p: p["rev"])
+    if best and best_ev > weakest["rev"]:
+        reason = (
+            f"{weakest['ticker']} ({weakest['source']}, day {weakest['days_held']}/{weakest['hold_days']}, "
+            f"REV={weakest['rev']:.2f}%) would be replaced by "
+            f"{best['ticker']} ({best['source']}, Score {best.get('score',3)}, EV={best_ev:.2f}%)"
+        )
+        return weakest, reason, best
+    else:
+        reason = (
+            f"Best incoming EV ({best_ev:.2f}%) does not exceed weakest open REV "
+            f"({weakest['rev']:.2f}% for {weakest['ticker']}) -- no replacement warranted"
+        )
+        return None, reason, best
+
+
+def _log_missed_trades_csv(signals, eviction_candidate):
+    """Append blocked signals to missed_trades.csv for longitudinal review."""
+    today_str = date.today().isoformat()
+    evict_ticker = eviction_candidate["ticker"] if eviction_candidate else "N/A"
+    write_header = not MISSED_TRADES_LOG.exists()
+    try:
+        with open(str(MISSED_TRADES_LOG), "a") as f:
+            if write_header:
+                f.write("date,ticker,source,direction,score,expected_ev_pct,eviction_candidate\n")
+            for sig in signals:
+                ev = round(_incoming_ev(sig), 2)
+                f.write(
+                    f"{today_str},{sig.get('ticker','')},{sig.get('source','')},"
+                    f"{sig.get('direction','')},{sig.get('score','')},{ev},{evict_ticker}\n"
+                )
+        logger.info(f"Logged {len(signals)} missed trade(s) to missed_trades.csv")
+    except Exception as e:
+        logger.error(f"Failed to write missed_trades.csv: {e}")
+
+
+def send_cap_alert_email(signals, vix, dry_run, open_positions):
+    """
+    Alert email when MAX_TOTAL_OPEN blocks incoming signals.
+    Subject tag: [CAP HIT] -- searchable in Gmail for longitudinal review.
+
+    Reports:
+      - Every blocked signal with score-adjusted EV estimate
+      - Full open book: entry price, live price at block time, unrealized % RIGHT NOW,
+        day X of Y, days remaining, REV estimate, evictability flag
+      - Hypothetical replacement: what WOULD have been swapped under the simple rule
+      - Decision log: why slot-replacement is not automated yet
+
+    NOTE: This function fetches live prices for open positions at cap-hit time.
+    That snapshot is the "return at decision point" for future longitudinal analysis.
+    When those positions close naturally, open_positions.return_pct holds the
+    eventual return. Join on (ticker, entry_date) to compare the two.
+    """
+    today_str = date.today().strftime("%Y-%m-%d")
+    mode = "DRY RUN" if dry_run else "LIVE"
+    subject = (
+        f"IB AutoTrader [{mode}] [CAP HIT] -- "
+        f"{len(signals)} signal(s) missed, {today_str}"
+    )
+
+    # Fetch live prices for all open positions -- snapshot at decision time
+    for pos in open_positions:
+        ticker = pos.get("ticker", "")
+        entry_price = pos.get("entry_price", 0.0)
+        direction = pos.get("direction", "BUY")
+        live = fetch_live_price(ticker)
+        pos["price_at_block"] = live
+        if live and entry_price:
+            if direction == "SHORT":
+                pos["unrealized_pct"] = round((entry_price - live) / entry_price * 100, 2)
+            else:
+                pos["unrealized_pct"] = round((live - entry_price) / entry_price * 100, 2)
+        else:
+            pos["unrealized_pct"] = None
+
+    # Log snapshot to capacity_events DB
+    try:
+        conn = sqlite3.connect(str(POSITIONS_DB))
+        c = conn.cursor()
+        for sig in signals:
+            adj_ev = round(_incoming_ev(sig), 2)
+            for pos in open_positions:
+                c.execute("""
+                    INSERT INTO capacity_events
+                    (event_date, blocked_ticker, blocked_source, blocked_score,
+                     blocked_direction, blocked_adj_ev_pct,
+                     open_ticker, open_source, open_entry_date, open_entry_price,
+                     open_price_at_block, open_unrealized_pct,
+                     open_days_held, open_days_remaining, open_is_evictable)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    today_str,
+                    sig.get("ticker"), sig.get("source"), sig.get("score"),
+                    sig.get("direction"), adj_ev,
+                    pos.get("ticker"), pos.get("source"), pos.get("entry_date"),
+                    pos.get("entry_price"), pos.get("price_at_block"),
+                    pos.get("unrealized_pct"), pos.get("days_held"),
+                    pos.get("days_remaining"),
+                    1 if pos.get("days_remaining", 99) <= 2 else 0
+                ))
+        conn.commit()
+        conn.close()
+        logger.info(f"capacity_events: logged {len(signals)} x {len(open_positions)} rows")
+    except Exception as e:
+        logger.error(f"capacity_events DB write failed: {e}")
+
+    # Eviction analysis
+    eviction_candidate, eviction_reason, best_incoming = _analyze_eviction(signals, open_positions)
+    _log_missed_trades_csv(signals, eviction_candidate)
+
+    # Build email
+    lines = []
+    lines.append("=" * 60)
+    lines.append("MAX POSITION CAP HIT -- MISSED TRADE REPORT")
+    lines.append("=" * 60)
+    lines.append(f"Date: {today_str}  |  Mode: {mode}  |  Cap: {MAX_TOTAL_OPEN}")
+    lines.append(f"VIX: {vix:.2f}" if vix else "VIX: N/A")
+    lines.append("")
+    lines.append(f"SIGNALS DROPPED ({len(signals)}):")
+    lines.append("-" * 60)
+    for s in signals:
+        meta = SIGNAL_METADATA.get(s.get("source", ""), {})
+        ev = _incoming_ev(s)
+        lines.append(
+            f"  {s.get('direction','?'):5s} {s.get('ticker','?'):<8s} "
+            f"[{s.get('source','')}] Score {s.get('score','')}  "
+            f"EV ~{ev:.2f}%  (signal avg: {meta.get('avg_return',0.0):.2f}%)"
+        )
+    lines.append("")
+    lines.append(f"OPEN POSITIONS AT DECISION POINT ({len(open_positions)}/{MAX_TOTAL_OPEN}):")
+    lines.append("  (snapshot: entry price | price right now | unrealized% | day X/Y | days left | REV)")
+    lines.append("-" * 60)
+    for pos in sorted(open_positions, key=lambda p: p["days_remaining"]):
+        prot  = "  [PROTECTED]" if pos["protected"] else ""
+        early = "  [<30% complete]" if pos["pct_complete"] < 0.30 else ""
+        evict = "  ** EVICTABLE **" if (not pos["protected"] and pos["pct_complete"] >= 0.30 and pos["days_remaining"] <= 2) else ""
+        live_str = f"${pos['price_at_block']:.2f}" if pos.get("price_at_block") else "N/A"
+        unreal_str = f"{pos['unrealized_pct']:+.1f}%" if pos.get("unrealized_pct") is not None else "N/A"
+        lines.append(
+            f"  {pos['ticker']:<8s} {pos.get('source',''):<16s} "
+            f"Entry ${pos['entry_price']:.2f} | Now {live_str} | {unreal_str} | "
+            f"Day {pos['days_held']:>2d}/{pos['hold_days']:>2d} | "
+            f"{pos['days_remaining']:>2d}d left | REV ~{pos['rev']:.2f}%"
+            f"{prot}{early}{evict}"
+        )
+    lines.append("")
+    lines.append("HYPOTHETICAL REPLACEMENT (observation only -- NO action taken):")
+    lines.append("-" * 60)
+    if eviction_candidate:
+        lines.append(f"  WOULD EVICT:  {eviction_reason}")
+    else:
+        lines.append(f"  NO REPLACEMENT:  {eviction_reason}")
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append("DATA COLLECTION NOTE:")
+    lines.append("  This email + capacity_events DB + missed_trades.csv are the")
+    lines.append("  evidence base for a Path B slot-replacement decision.")
+    lines.append("  Review after ~6 months: if cap hits are frequent and EV losses")
+    lines.append("  are material, implement validated REV-based replacement logic.")
+    lines.append("  To analyze: JOIN capacity_events ON open_positions (ticker, entry_date)")
+    lines.append("  Compare open_unrealized_pct (today) vs open_positions.return_pct (eventual).")
+    lines.append("  Decision recorded: Master_status.md Apr 9 2026.")
+
+    body = "\n".join(lines)
+    try:
+        msg = MIMEMultipart()
+        msg["From"]    = config.EMAIL_SENDER
+        msg["To"]      = ", ".join(config.EMAIL_RECIPIENTS)
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT) as server:
+            server.starttls()
+            server.login(config.EMAIL_SENDER, config.EMAIL_PASSWORD)
+            server.send_message(msg)
+        logger.info(f"Cap alert email sent: {subject}")
+    except Exception as e:
+        logger.error(f"Cap alert email failed: {e}")
+
 
 def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
                        positions_closed=None):
@@ -1390,6 +1674,33 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
         subject = f"IB AutoTrader [{mode}] — {closed_count} position(s) closed, {today_str}"
 
     lines = []
+
+    # --- Open position counter (top of every email) ---
+    _open_ct = 0
+    if POSITIONS_DB.exists():
+        try:
+            _oc = sqlite3.connect(str(POSITIONS_DB))
+            _occ = _oc.cursor()
+            _occ.execute("SELECT COUNT(*) FROM open_positions WHERE status='OPEN'")
+            _open_ct = _occ.fetchone()[0]
+            _oc.close()
+        except Exception:
+            _open_ct = 0
+    _slots_free = MAX_TOTAL_OPEN - _open_ct
+    if _open_ct >= MAX_TOTAL_OPEN:
+        _slot_lbl  = "AT CAPACITY -- new signals blocked"
+        _warn      = " !!!"
+    elif _slots_free <= 3:
+        _slot_lbl  = f"{_slots_free} slot(s) free -- nearing cap"
+        _warn      = " !!"
+    else:
+        _slot_lbl  = f"{_slots_free} slot(s) free"
+        _warn      = ""
+    lines.append("=" * 52)
+    lines.append(f"  OPEN POSITIONS: {_open_ct} / {MAX_TOTAL_OPEN}   {_slot_lbl}{_warn}")
+    lines.append("=" * 52)
+    lines.append("")
+
     lines.append(f"IB AUTO-TRADER EXECUTION SUMMARY")
     lines.append(f"Mode: {mode}")
     lines.append(f"Date: {today_str}")
@@ -1780,6 +2091,9 @@ def run(dry_run=False, verbose=False):
     slots_available = MAX_TOTAL_OPEN - current_open
     if slots_available <= 0:
         logger.warning(f"MAX_TOTAL_OPEN ({MAX_TOTAL_OPEN}) reached -- skipping new entries")
+        if signals:
+            open_pos = _get_open_positions_for_cap()
+            send_cap_alert_email(signals, vix, dry_run, open_pos)
         send_summary_email([], signals, vix, dry_run, positions_closed)
         return
     logger.info(f"Open: {current_open}/{MAX_TOTAL_OPEN} -- {slots_available} slot(s) available")
