@@ -1111,6 +1111,36 @@ def init_positions_db():
             UNIQUE(ticker, entry_date)
         )
     """)
+    # Signal benchmarks lookup (backtest expected returns)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS signal_benchmarks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            expected_return_pct REAL NOT NULL,
+            expected_hold_days INTEGER NOT NULL,
+            UNIQUE(source, direction)
+        )
+    """)
+    # Populate/update benchmarks from validated backtests (Full 2025)
+    benchmarks = [
+        ("8K_1.01",       "SHORT", 3.17,  5),
+        ("DIV_CUT",       "BUY",   15.77, 60),
+        ("PEAD_BULL",     "BUY",   4.24,  28),
+        ("PEAD_BEAR",     "SHORT", 1.74,  28),
+        ("SI_SQUEEZE",    "BUY",   1.70,  28),
+        ("COT_BULL",      "BUY",   1.70,  56),
+        ("COT_BEAR",      "SHORT", 0.75,  56),
+        ("CEL_BEAR",      "SHORT", 0.21,  5),
+        ("THIRTEENF_BULL","BUY",   9.97,  91),
+    ]
+    for src, dirn, ret_pct, hold_days in benchmarks:
+        c.execute("""
+            INSERT OR REPLACE INTO signal_benchmarks
+            (source, direction, expected_return_pct, expected_hold_days)
+            VALUES (?, ?, ?, ?)
+        """, (src, dirn, ret_pct, hold_days))
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS capacity_events (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1136,17 +1166,101 @@ def init_positions_db():
     logger.info(f"Positions DB ready: {POSITIONS_DB}")
 
 
+def _fetch_spy_price(target_date=None):
+    """Fetch SPY close price with 3-source fallback. Returns float or None."""
+    if target_date is None:
+        target_date = date.today().isoformat()
+    # Source 1: yfinance
+    try:
+        import threading, pandas
+        result = [None]
+        def _yf():
+            try:
+                t = yf.Ticker("SPY")
+                hist = t.history(period="5d")
+                if not hist.empty:
+                    if isinstance(hist.columns, pandas.MultiIndex):
+                        hist.columns = [c[0] for c in hist.columns]
+                    result[0] = float(hist["Close"].iloc[-1])
+            except Exception:
+                pass
+        th = threading.Thread(target=_yf, daemon=True)
+        th.start()
+        th.join(timeout=15)
+        if result[0] is not None:
+            return result[0]
+    except Exception:
+        pass
+
+    # Source 2: Yahoo direct HTTP
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/SPY",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+        logger.info(f"SPY price: ${price:.2f} (Yahoo direct)")
+        return price
+    except Exception as e:
+        logger.warning(f"SPY Yahoo direct failed: {e}")
+
+    # Source 3: FMP
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/quote/SPY?apikey={config.FMP_API_KEY}",
+            timeout=10
+        )
+        data = r.json()
+        if data and isinstance(data, list) and "price" in data[0]:
+            price = float(data[0]["price"])
+            logger.info(f"SPY price: ${price:.2f} (FMP)")
+            return price
+    except Exception as e:
+        logger.warning(f"SPY FMP failed: {e}")
+
+    logger.warning("SPY price fetch failed on all 3 sources")
+    return None
+
+
 def log_position_entry(ticker, entry_date, entry_price, shares, position_size,
-                       order_id=None, source="DIV_CUT", direction="BUY"):
-    """Write a new OPEN position to positions.db."""
+                       order_id=None, source="DIV_CUT", direction="BUY",
+                       score=None):
+    """Write a new OPEN position to positions.db with performance tracking fields."""
     try:
         conn = sqlite3.connect(str(POSITIONS_DB))
         c = conn.cursor()
+
+        # Look up expected return/hold from signal_benchmarks
+        expected_return_pct = None
+        expected_hold_days = None
+        try:
+            c.execute("""
+                SELECT expected_return_pct, expected_hold_days
+                FROM signal_benchmarks
+                WHERE source = ? AND direction = ?
+            """, (source, direction))
+            row = c.fetchone()
+            if row:
+                expected_return_pct = row[0]
+                expected_hold_days = row[1]
+        except Exception as e:
+            logger.warning(f"Benchmark lookup failed for {source}/{direction}: {e}")
+
+        # Fetch SPY entry price (non-blocking — NULL if unavailable)
+        spy_entry_price = _fetch_spy_price(entry_date)
+        if spy_entry_price:
+            logger.info(f"  SPY entry price: ${spy_entry_price:.2f}")
+
         c.execute("""
             INSERT OR IGNORE INTO open_positions
-            (ticker, direction, entry_date, entry_price, shares, position_size, order_id, source, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
-        """, (ticker, direction, entry_date, entry_price, shares, position_size, order_id, source))
+            (ticker, direction, entry_date, entry_price, shares, position_size,
+             order_id, source, status, expected_return_pct, expected_hold_days,
+             score, spy_entry_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
+        """, (ticker, direction, entry_date, entry_price, shares, position_size,
+              order_id, source, expected_return_pct, expected_hold_days,
+              score, spy_entry_price))
         conn.commit()
         conn.close()
         logger.info(f"  Position logged: {ticker} | {shares} shares @ ${entry_price:.2f} | Entry: {entry_date}")
@@ -1176,7 +1290,8 @@ def check_and_close_positions(account_id, dry_run, vix):
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("""
-            SELECT id, ticker, entry_date, entry_price, shares, position_size, order_id, source, direction
+            SELECT id, ticker, entry_date, entry_price, shares, position_size,
+                   order_id, source, direction, expected_return_pct, spy_entry_price
             FROM open_positions
             WHERE status = 'OPEN'
         """)
@@ -1272,6 +1387,28 @@ def check_and_close_positions(account_id, dry_run, vix):
             else:
                 logger.error(f"  {ticker}: cannot close — no conid or account_id")
 
+        # Compute performance-tracking fields at close
+        vs_expected_pct = None
+        spy_return_pct = None
+        alpha_vs_spy = None
+
+        expected_ret = pos["expected_return_pct"]
+        if expected_ret is not None:
+            vs_expected_pct = round(return_pct - expected_ret, 2)
+
+        spy_entry = pos["spy_entry_price"]
+        if spy_entry:
+            spy_now = _fetch_spy_price()
+            if spy_now:
+                if pos_direction == "SHORT":
+                    spy_return_pct = round(((spy_entry - spy_now) / spy_entry) * 100, 2)
+                else:
+                    spy_return_pct = round(((spy_now - spy_entry) / spy_entry) * 100, 2)
+                alpha_vs_spy = round(return_pct - spy_return_pct, 2)
+                logger.info(f"  {ticker}: SPY {spy_entry:.2f}->{spy_now:.2f} = {spy_return_pct:+.2f}% | alpha={alpha_vs_spy:+.2f}%")
+            else:
+                logger.warning(f"  {ticker}: SPY close price unavailable — alpha fields will be NULL")
+
         # Mark closed in DB
         try:
             conn = sqlite3.connect(str(POSITIONS_DB))
@@ -1282,9 +1419,13 @@ def check_and_close_positions(account_id, dry_run, vix):
                     close_date = ?,
                     close_price = ?,
                     close_reason = ?,
-                    return_pct = ?
+                    return_pct = ?,
+                    vs_expected_pct = ?,
+                    spy_return_pct = ?,
+                    alpha_vs_spy = ?
                 WHERE id = ?
-            """, (today.isoformat(), current_price, close_reason, round(return_pct, 2), pos_id))
+            """, (today.isoformat(), current_price, close_reason, round(return_pct, 2),
+                  vs_expected_pct, spy_return_pct, alpha_vs_spy, pos_id))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -2168,6 +2309,7 @@ def run(dry_run=False, verbose=False):
                     order_id="DRY_RUN",
                     source=signal["source"],
                     direction=signal["direction"],
+                    score=signal["score"],
                 )
             executed.append(signal)
             order_count += 1
@@ -2198,6 +2340,7 @@ def run(dry_run=False, verbose=False):
                     order_id=str(order_id),
                     source=signal["source"],
                     direction=signal["direction"],
+                    score=signal["score"],
                 )
             executed.append(signal)
             order_count += 1
