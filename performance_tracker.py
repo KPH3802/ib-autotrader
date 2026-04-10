@@ -66,8 +66,8 @@ BEDROCK_HOLDINGS = [
 BEDROCK_TOTAL_COST = 4749.94
 
 # Digital Alpha constants
-DIGITAL_ALPHA_COST_BASIS = 5000
-DIGITAL_ALPHA_FUNDING_DATE = "2026-03-09"
+DIGITAL_ALPHA_COST_BASIS = 9923.58  # Baseline Apr 10 2026: $5K funded + personal crypto unstaked/sold to USDC. KEEP/BOND (~$19) excluded -- off-exchange, not autotrader capital.
+DIGITAL_ALPHA_FUNDING_DATE = "2026-04-10"  # Reset to Apr 10 2026 -- new baseline date after full USDC consolidation
 USDC_STAKING_APY = 0.035
 
 
