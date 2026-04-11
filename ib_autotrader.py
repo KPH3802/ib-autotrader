@@ -82,6 +82,7 @@ TRADE_LOG = SCRIPT_DIR / config.TRADE_LOG_PATH
 POSITIONS_DB = SCRIPT_DIR / getattr(config, "POSITIONS_DB", "positions.db")
 
 # Dividend cut signal settings
+DIV_CUT_SUSPENDED = True    # SUSPENDED Apr 11 2026 -- signal collapses on broad universe (-2.15% alpha, 133 trades). Large-cap filter required.
 DIV_CUT_MIN_SCORE = 3       # Minimum net_score to enter
 DIV_CUT_HOLD_DAYS = 60      # Primary exit: Day 60
 DIV_CUT_BREAKER = -39.9     # Catastrophic circuit breaker (% return)
@@ -414,6 +415,9 @@ def query_div_cut_signals(today_str):
     Only returns signals with net_score >= DIV_CUT_MIN_SCORE (default: 3).
     """
     signals = []
+    if DIV_CUT_SUSPENDED:
+        logger.info("DIV_CUT signal SUSPENDED (Apr 11 2026) -- broad universe backtest shows -2.15% alpha. Scanner still runs for data collection. Re-enable when large-cap validation complete.")
+        return signals
     mail = _connect_gmail()
     if not mail:
         logger.warning("Div cut signals unavailable — Gmail IMAP failed")
