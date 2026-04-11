@@ -648,24 +648,40 @@ def query_cot_signals_from_email(today_str):
             logger.info(f"COT email: '{subj}'")
             if 'COT BULL:' not in subj and 'COT BEAR:' not in subj:
                 continue
-            bull = re.search(r'COT BULL:\s*([A-Z ,]+?)(?:\s*\||$)', subj)
+            bull = re.search(r'COT BULL:\s*([A-Z0-9(), ]+?)(?:\s*\||$)', subj)
             if bull:
-                for t in bull.group(1).split(','):
-                    t = t.strip()
+                for token in bull.group(1).split(','):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    # Parse TICKER(N) score format: WEAT(5) -> ticker=WEAT, score=5
+                    m = re.match(r'([A-Z]+)\((\d+)\)', token)
+                    if m:
+                        t, score = m.group(1), int(m.group(2))
+                    else:
+                        t, score = token, 3
                     if t and t not in seen:
                         seen.add(t)
                         signals.append({'source':'COT_BULL','ticker':t,'direction':'BUY',
-                                        'score':3,'price':None,'company':'','sector':'',
-                                        'detail':'COT commercial extreme long signal'})
-            bear = re.search(r'COT BEAR:\s*([A-Z ,]+?)(?:\s*\||$)', subj)
+                                        'score':score,'price':None,'company':'','sector':'',
+                                        'detail':f'COT commercial extreme long signal (score {score})'})
+            bear = re.search(r'COT BEAR:\s*([A-Z0-9(), ]+?)(?:\s*\||$)', subj)
             if bear:
-                for t in bear.group(1).split(','):
-                    t = t.strip()
+                for token in bear.group(1).split(','):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    # Parse TICKER(N) score format: WEAT(5) -> ticker=WEAT, score=5
+                    m = re.match(r'([A-Z]+)\((\d+)\)', token)
+                    if m:
+                        t, score = m.group(1), int(m.group(2))
+                    else:
+                        t, score = token, 3
                     if t and t not in seen:
                         seen.add(t)
                         signals.append({'source':'COT_BEAR','ticker':t,'direction':'SHORT',
-                                        'score':3,'price':None,'company':'','sector':'',
-                                        'detail':'COT commercial extreme short signal'})
+                                        'score':score,'price':None,'company':'','sector':'',
+                                        'detail':f'COT commercial extreme short signal (score {score})'})
         logger.info(f'COT signals: {len([s for s in signals if s["direction"]=="BUY"])} BULL, {len([s for s in signals if s["direction"]=="SHORT"])} BEAR')
     except Exception as e:
         logger.error(f'COT email parse failed: {e}')
