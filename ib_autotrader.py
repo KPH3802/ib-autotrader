@@ -1944,7 +1944,7 @@ WATCHDOG_SCANNERS = [
     {
         "name":             "Form4 Scanner",
         "subject_fragment": "Form 4 Scanner Status",
-        "max_silence_days": 4,
+        "max_silence_days": 5,
     },
     {
         "name":             "8-K Scanner",
@@ -1958,23 +1958,23 @@ WATCHDOG_SCANNERS = [
     },
     {
         "name":             "SI Scanner",
-        "subject_fragment": "SI Scanner",
-        "max_silence_days": 2,
+        "subject_fragment": "SI SQUEEZE:",
+        "max_silence_days": 16,
     },
     {
         "name":             "COT Scanner",
-        "subject_fragment": "COT Scanner",
-        "max_silence_days": 8,
+        "subject_fragment": "COT",
+        "max_silence_days": 10,
     },
     {
         "name":             "CEL Scanner",
-        "subject_fragment": "CEL Scanner",
-        "max_silence_days": 2,
+        "subject_fragment": "CEL BEAR:",
+        "max_silence_days": 30,
     },
     {
         "name":             "13F Scanner",
-        "subject_fragment": "13F Scanner",
-        "max_silence_days": 2,
+        "subject_fragment": "13F",
+        "max_silence_days": 45,
     },
 ]
 
