@@ -1948,7 +1948,7 @@ WATCHDOG_SCANNERS = [
     },
     {
         "name":             "8-K Scanner",
-        "subject_fragment": "8-K SHORT:",
+        "subject_fragment": "8-K",
         "max_silence_days": 7,
     },
     {
@@ -1975,6 +1975,11 @@ WATCHDOG_SCANNERS = [
         "name":             "13F Scanner",
         "subject_fragment": "13F",
         "max_silence_days": 45,
+    },
+    {
+        "name":             "Dividend Initiation Scanner",
+        "subject_fragment": "Dividend Scanner",
+        "max_silence_days": 3,
     },
 ]
 
