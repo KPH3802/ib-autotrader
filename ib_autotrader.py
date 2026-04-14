@@ -1972,11 +1972,6 @@ WATCHDOG_SCANNERS = [
         "max_silence_days": 30,
     },
     {
-        "name":             "13F Scanner",
-        "subject_fragment": "13F",
-        "max_silence_days": 45,
-    },
-    {
         "name":             "Dividend Initiation Scanner",
         "subject_fragment": "Dividend Scanner",
         "max_silence_days": 3,
