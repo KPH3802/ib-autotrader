@@ -105,6 +105,15 @@ EIGHT_K_BREAKER   = -39.9   # Catastrophic circuit breaker (% return)
 F4_HOLD_DAYS  = 5       # 5-day hold (validated window in backtest)
 F4_BREAKER    = -39.9   # Catastrophic circuit breaker (% return)
 
+# CEL (Commodity-Equity Lag) signal settings
+CEL_HOLD_DAYS  = 5        # 5-day hold (validated window in backtest, p<0.05)
+CEL_BREAKER    = -39.9    # Catastrophic circuit breaker (% return)
+# SI Squeeze signal settings
+SI_HOLD_DAYS   = 28       # 4-week hold (validated window in backtest)
+SI_BREAKER     = -39.9    # Catastrophic circuit breaker (% return)
+# COT signal settings
+COT_HOLD_DAYS  = 56       # 8-week hold (validated window in backtest)
+COT_BREAKER    = -39.9    # Catastrophic circuit breaker (% return)
 # Gmail IMAP settings (same credentials as outbound email)
 IMAP_SERVER = "imap.gmail.com"
 IMAP_PORT = 993
@@ -1356,6 +1365,18 @@ def check_and_close_positions(account_id, dry_run, vix):
             hold_limit    = F4_HOLD_DAYS
             day_exit_lbl  = "DAY_5"
             breaker_val   = F4_BREAKER
+        elif pos_source == "CEL_BEAR":
+            hold_limit    = CEL_HOLD_DAYS
+            day_exit_lbl  = "DAY_5"
+            breaker_val   = CEL_BREAKER
+        elif pos_source.startswith("SI_"):
+            hold_limit    = SI_HOLD_DAYS
+            day_exit_lbl  = "DAY_28"
+            breaker_val   = SI_BREAKER
+        elif pos_source.startswith("COT_"):
+            hold_limit    = COT_HOLD_DAYS
+            day_exit_lbl  = "DAY_56"
+            breaker_val   = COT_BREAKER
         else:
             hold_limit    = DIV_CUT_HOLD_DAYS
             day_exit_lbl  = "DAY_60"
