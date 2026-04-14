@@ -2240,6 +2240,8 @@ def run(dry_run=False, verbose=False):
 
     # Daily loss limit check (two-tier)
     if check_daily_loss_limit(account_value):
+        for s in signals:
+            s["skip_reason"] = "Daily loss limit reached"
         send_summary_email([], signals, vix, dry_run, positions_closed)
         return
 
@@ -2257,6 +2259,8 @@ def run(dry_run=False, verbose=False):
     slots_available = MAX_TOTAL_OPEN - current_open
     if slots_available <= 0:
         logger.warning(f"MAX_TOTAL_OPEN ({MAX_TOTAL_OPEN}) reached -- skipping new entries")
+        for s in signals:
+            s["skip_reason"] = f"MAX_TOTAL_OPEN ({MAX_TOTAL_OPEN}) reached"
         if signals:
             open_pos = _get_open_positions_for_cap()
             send_cap_alert_email(signals, vix, dry_run, open_pos)
