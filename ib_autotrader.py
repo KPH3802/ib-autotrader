@@ -165,10 +165,14 @@ def get_current_vix(timeout=30):
 
     if t.is_alive():
         logger.warning(f"VIX yfinance timed out after {timeout}s — trying fallback")
+        yf_err_compact = "timeout"
     else:
         logger.warning(f"VIX yfinance failed ({yf_error[0]}) — trying fallback")
+        yf_err_compact = str(yf_error[0])[:100].strip().replace("\n", " ") if yf_error[0] else "empty_data"
 
     # --- Fallback 1: direct Yahoo Finance HTTP (bypasses yfinance library) ---
+    yahoo_price = None
+    yahoo_err = None
     try:
         import requests as req
         r = req.get(
@@ -176,13 +180,19 @@ def get_current_vix(timeout=30):
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10
         )
-        price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-        logger.info(f"VIX: {price:.2f} (Yahoo direct fallback)")
-        return price
+        yahoo_price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
     except Exception as e:
-        logger.warning(f"VIX Yahoo direct failed: {e} — trying FMP")
+        yahoo_err = e
+    logger.warning(f"[FALLBACK] source=vix_price primary=yfinance primary_error={yf_err_compact} fallback=yahoo_direct result={'ok' if yahoo_price is not None else 'fail'}")
+    if yahoo_price is not None:
+        logger.info(f"VIX: {yahoo_price:.2f} (Yahoo direct fallback)")
+        return yahoo_price
+    if yahoo_err is not None:
+        logger.warning(f"VIX Yahoo direct failed: {yahoo_err} — trying FMP")
 
     # --- Fallback 2: FMP quote endpoint (independent provider) ---
+    yahoo_err_compact = str(yahoo_err)[:100].strip().replace("\n", " ") if yahoo_err else "yahoo_direct_failed"
+    fmp_price = None
     try:
         import requests as req
         r = req.get(
@@ -191,12 +201,15 @@ def get_current_vix(timeout=30):
         )
         data = r.json()
         if data and isinstance(data, list) and "price" in data[0]:
-            price = float(data[0]["price"])
-            logger.info(f"VIX: {price:.2f} (FMP fallback)")
-            return price
-        logger.warning("FMP VIX response empty or malformed")
+            fmp_price = float(data[0]["price"])
+        else:
+            logger.warning("FMP VIX response empty or malformed")
     except Exception as e:
         logger.error(f"VIX FMP fallback failed: {e}")
+    logger.warning(f"[FALLBACK] source=vix_price primary=yahoo_direct primary_error={yahoo_err_compact} fallback=fmp result={'ok' if fmp_price is not None else 'fail'}")
+    if fmp_price is not None:
+        logger.info(f"VIX: {fmp_price:.2f} (FMP fallback)")
+        return fmp_price
 
     logger.error("VIX fetch failed on all 3 sources (yfinance, Yahoo direct, FMP) — fail-safe will block new entries")
     send_twilio_sms("[GMC ALERT] VIX fetch failed all 3 sources. New entries blocked.")
@@ -922,6 +935,7 @@ def fetch_live_price(ticker):
     """
     import threading
     result = [None]
+    yf_error = [None]
 
     def _fetch_yf():
         try:
@@ -932,8 +946,8 @@ def fetch_live_price(ticker):
                 if isinstance(hist.columns, pandas.MultiIndex):
                     hist.columns = [c[0] for c in hist.columns]
                 result[0] = float(hist["Close"].iloc[-1])
-        except Exception:
-            pass
+        except Exception as e:
+            yf_error[0] = e
 
     t = threading.Thread(target=_fetch_yf, daemon=True)
     t.start()
@@ -941,7 +955,11 @@ def fetch_live_price(ticker):
     if result[0] is not None:
         return result[0]
 
+    yf_err_compact = str(yf_error[0])[:100].strip().replace("\n", " ") if yf_error[0] else "timeout_or_empty"
+
     # Fallback 1: Yahoo direct HTTP
+    yahoo_price = None
+    yahoo_err = None
     try:
         import requests as req
         encoded = req.utils.quote(ticker)
@@ -950,13 +968,18 @@ def fetch_live_price(ticker):
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10
         )
-        price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-        logger.info(f"Price {ticker}: ${price:.2f} (Yahoo direct)")
-        return price
+        yahoo_price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
     except Exception as e:
+        yahoo_err = e
         logger.warning(f"Price Yahoo direct failed for {ticker}: {e}")
+    logger.warning(f"[FALLBACK] source=price_{ticker} primary=yfinance primary_error={yf_err_compact} fallback=yahoo_direct result={'ok' if yahoo_price is not None else 'fail'}")
+    if yahoo_price is not None:
+        logger.info(f"Price {ticker}: ${yahoo_price:.2f} (Yahoo direct)")
+        return yahoo_price
 
     # Fallback 2: FMP
+    yahoo_err_compact = str(yahoo_err)[:100].strip().replace("\n", " ") if yahoo_err else "yahoo_direct_failed"
+    fmp_price = None
     try:
         import requests as req
         r = req.get(
@@ -965,11 +988,13 @@ def fetch_live_price(ticker):
         )
         data = r.json()
         if data and isinstance(data, list) and "price" in data[0]:
-            price = float(data[0]["price"])
-            logger.info(f"Price {ticker}: ${price:.2f} (FMP)")
-            return price
+            fmp_price = float(data[0]["price"])
     except Exception as e:
         logger.warning(f"Price FMP failed for {ticker}: {e}")
+    logger.warning(f"[FALLBACK] source=price_{ticker} primary=yahoo_direct primary_error={yahoo_err_compact} fallback=fmp result={'ok' if fmp_price is not None else 'fail'}")
+    if fmp_price is not None:
+        logger.info(f"Price {ticker}: ${fmp_price:.2f} (FMP)")
+        return fmp_price
 
     logger.error(f"Price fetch failed on all 3 sources for {ticker}")
     return None
@@ -1047,6 +1072,7 @@ def get_account_id():
 def get_event_alpha_account_value():
     '''Fetch Event Alpha account net liquidation value from IB Gateway.
     Falls back to EVENT_ALPHA_ACCOUNT_VALUE config constant if IB unreachable.'''
+    ib_err = "no_response_or_zero_nlv"
     try:
         # Tickle the session to ensure portfolio API responds
         ib_request('POST', '/tickle')
@@ -1059,7 +1085,9 @@ def get_event_alpha_account_value():
                     logger.info(f'Account value from IB Gateway: \${float(nlv):,.2f}')
                     return float(nlv)
     except Exception as e:
+        ib_err = str(e)[:100].strip().replace("\n", " ")
         logger.warning(f'Could not fetch account value from IB: {e}')
+    logger.warning(f"[FALLBACK] source=ea_account_value primary=ib_gateway primary_error={ib_err} fallback=config_hardcode result=ok")
     logger.info(f'Using config fallback account value: \${EVENT_ALPHA_ACCOUNT_VALUE:,}')
     return float(EVENT_ALPHA_ACCOUNT_VALUE)
 
@@ -1200,9 +1228,11 @@ def _fetch_spy_price(target_date=None):
     if target_date is None:
         target_date = date.today().isoformat()
     # Source 1: yfinance
+    yf_err_msg = "timeout_or_empty"
     try:
         import threading, pandas
         result = [None]
+        yf_inner_err = [None]
         def _yf():
             try:
                 t = yf.Ticker("SPY")
@@ -1211,30 +1241,39 @@ def _fetch_spy_price(target_date=None):
                     if isinstance(hist.columns, pandas.MultiIndex):
                         hist.columns = [c[0] for c in hist.columns]
                     result[0] = float(hist["Close"].iloc[-1])
-            except Exception:
-                pass
+            except Exception as e:
+                yf_inner_err[0] = e
         th = threading.Thread(target=_yf, daemon=True)
         th.start()
         th.join(timeout=15)
         if result[0] is not None:
             return result[0]
-    except Exception:
-        pass
+        if yf_inner_err[0] is not None:
+            yf_err_msg = str(yf_inner_err[0])[:100].strip().replace("\n", " ")
+    except Exception as e:
+        yf_err_msg = str(e)[:100].strip().replace("\n", " ")
 
     # Source 2: Yahoo direct HTTP
+    yahoo_price = None
+    yahoo_err = None
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/SPY",
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10
         )
-        price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-        logger.info(f"SPY price: ${price:.2f} (Yahoo direct)")
-        return price
+        yahoo_price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
     except Exception as e:
+        yahoo_err = e
         logger.warning(f"SPY Yahoo direct failed: {e}")
+    logger.warning(f"[FALLBACK] source=spy_close primary=yfinance primary_error={yf_err_msg} fallback=yahoo_direct result={'ok' if yahoo_price is not None else 'fail'}")
+    if yahoo_price is not None:
+        logger.info(f"SPY price: ${yahoo_price:.2f} (Yahoo direct)")
+        return yahoo_price
 
     # Source 3: FMP
+    yahoo_err_msg = str(yahoo_err)[:100].strip().replace("\n", " ") if yahoo_err else "yahoo_direct_failed"
+    fmp_price = None
     try:
         r = requests.get(
             f"https://financialmodelingprep.com/api/v3/quote/SPY?apikey={config.FMP_API_KEY}",
@@ -1242,11 +1281,13 @@ def _fetch_spy_price(target_date=None):
         )
         data = r.json()
         if data and isinstance(data, list) and "price" in data[0]:
-            price = float(data[0]["price"])
-            logger.info(f"SPY price: ${price:.2f} (FMP)")
-            return price
+            fmp_price = float(data[0]["price"])
     except Exception as e:
         logger.warning(f"SPY FMP failed: {e}")
+    logger.warning(f"[FALLBACK] source=spy_close primary=yahoo_direct primary_error={yahoo_err_msg} fallback=fmp result={'ok' if fmp_price is not None else 'fail'}")
+    if fmp_price is not None:
+        logger.info(f"SPY price: ${fmp_price:.2f} (FMP)")
+        return fmp_price
 
     logger.warning("SPY price fetch failed on all 3 sources")
     return None
