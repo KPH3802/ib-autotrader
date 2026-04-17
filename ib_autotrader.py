@@ -1600,7 +1600,7 @@ SIGNAL_METADATA = {
     "F4_SELL_S2":     {"avg_return": 0.60,  "hold_days": 5,  "protected": False},
 }
 
-MISSED_TRADES_LOG = SCRIPT_DIR / "missed_trades.csv"
+MISSED_TRADES_LOG = Path.home() / "gmc_data" / "missed_trades.csv"
 
 
 def _incoming_ev(sig):
