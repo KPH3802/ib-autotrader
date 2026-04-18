@@ -91,7 +91,7 @@ DIV_CUT_LOOKBACK_DAYS = 1   # How many days back
 # PEAD signal settings
 PEAD_HOLD_DAYS = 28         # 4-week hold (matches backtest)
 PEAD_BREAKER   = -39.9      # Catastrophic circuit breaker
-PEAD_LOOKBACK_DAYS = 2      # Check emails from last 2 days to scan for cut emails (1 = today's email only — matches backtest entry timing)
+PEAD_LOOKBACK_DAYS = 1      # Check emails from last 2 days to scan for cut emails (1 = today's email only — matches backtest entry timing)
 # 13F Institutional Initiations signal settings
 THIRTEENF_HOLD_DAYS     = 91     # 13-week hold (matches backtest)
 THIRTEENF_BREAKER       = -39.9  # Catastrophic circuit breaker
