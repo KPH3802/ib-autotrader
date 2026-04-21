@@ -19,6 +19,7 @@ Reads nightly signals from three sources — 8-K scanner emails, Form4 insider a
 - **M&A Filter:** Skip 8-K shorts if acquisition/merger news detected via yfinance
 - **Div Cut Exits:** Day 60 time exit OR -40% catastrophic circuit breaker. No stop loss. No profit target.
 - **Max orders per run:** 10 (configurable)
+- **Gateway-fail halt:** If IB Gateway cannot return an account value, the trader emails a [GMC CRITICAL] alert and raises RuntimeError instead of silently falling back to a hardcoded value. Prevents position oversizing during gateway outages.
 
 ## Prerequisites
 

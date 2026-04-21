@@ -10,6 +10,7 @@ Never commit config.py to git.
 EMAIL_SENDER = "your_email@gmail.com"
 EMAIL_PASSWORD = "your_app_password"       # Gmail App Password (not your login password)
 EMAIL_RECIPIENTS = ["your_email@gmail.com"]
+CRITICAL_ALERT_RECIPIENTS = ["your_email@gmail.com", "backup_email@gmail.com"]  # Critical halt alerts go to both
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 

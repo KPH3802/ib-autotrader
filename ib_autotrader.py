@@ -1071,7 +1071,7 @@ def get_account_id():
 
 def get_event_alpha_account_value():
     '''Fetch Event Alpha account net liquidation value from IB Gateway.
-    Falls back to EVENT_ALPHA_ACCOUNT_VALUE config constant if IB unreachable.'''
+    Raises RuntimeError if IB Gateway is unreachable -- never silently falls back.'''
     ib_err = "no_response_or_zero_nlv"
     try:
         # Tickle the session to ensure portfolio API responds
@@ -1087,9 +1087,10 @@ def get_event_alpha_account_value():
     except Exception as e:
         ib_err = str(e)[:100].strip().replace("\n", " ")
         logger.warning(f'Could not fetch account value from IB: {e}')
-    logger.warning(f"[FALLBACK] source=ea_account_value primary=ib_gateway primary_error={ib_err} fallback=config_hardcode result=ok")
-    logger.info(f'Using config fallback account value: \${EVENT_ALPHA_ACCOUNT_VALUE:,}')
-    return float(EVENT_ALPHA_ACCOUNT_VALUE)
+    logger.warning(f"[FALLBACK] source=ea_account_value primary=ib_gateway primary_error={ib_err} fallback=HALT result=blocked")
+    logger.critical(f"IB Gateway unavailable -- halting to prevent position oversizing. Reason: {ib_err}")
+    send_gateway_fail_email(ib_err)
+    raise RuntimeError(f"IB Gateway unavailable: {ib_err}")
 
 
 def search_contract(ticker):
@@ -1613,6 +1614,37 @@ def send_holiday_email(today_str, dry_run=False):
     except Exception as e:
         logger.error(f"Holiday email failed: {e}")
 
+
+def send_gateway_fail_email(reason):
+    """Critical alert: IB Gateway unavailable, trading halted."""
+    from datetime import datetime
+    from email.mime.text import MIMEText
+    recipients = getattr(config, "CRITICAL_ALERT_RECIPIENTS",
+                         config.EMAIL_RECIPIENTS)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+    subject = "[GMC CRITICAL] IB Gateway unavailable -- trading halted"
+    body = (
+        f"IB AutoTrader halted at {ts}.\n\n"
+        f"Reason: {reason}\n\n"
+        f"No account value was retrievable from IB Gateway. The autotrader "
+        f"refused to fall back to the $10K config hardcode (which would "
+        f"oversize positions at current NLV). No orders were placed.\n\n"
+        f"ACTION REQUIRED: Investigate IB Gateway status on Mac Studio, "
+        f"re-authenticate if needed, then re-run the autotrader manually "
+        f"if the day's signals still have entry edge.\n"
+    )
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = config.EMAIL_SENDER
+        msg["To"] = ", ".join(recipients)
+        with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT) as s:
+            s.starttls()
+            s.login(config.EMAIL_SENDER, config.EMAIL_PASSWORD)
+            s.sendmail(config.EMAIL_SENDER, recipients, msg.as_string())
+        logger.info(f"Gateway-fail alert email sent to {recipients}")
+    except Exception as e:
+        logger.error(f"Gateway-fail alert email FAILED: {e}")
 
 
 # ---------------------------------------------------------------------------
