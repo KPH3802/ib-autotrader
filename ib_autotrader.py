@@ -2047,8 +2047,8 @@ WATCHDOG_SCANNERS = [
     },
     {
         "name":             "PEAD Scanner",
-        "subject_fragment": "PEAD Scanner",
-        "max_silence_days": 2,
+        "subject_fragment": "PEAD",
+        "max_silence_days": 14,
     },
     {
         "name":             "SI Scanner",
