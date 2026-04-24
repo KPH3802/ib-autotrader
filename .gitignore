@@ -5,3 +5,11 @@ __pycache__/
 *.pdf
 .DS_Store
 clientportal/
+
+# Added Apr 24 2026 -- audit P2: close untracked-but-exposed file risk
+*.db
+*.log
+clientportal_new/
+clientportal.gw.zip
+missed_trades.csv
+archive_*/
