@@ -57,14 +57,17 @@ python3 ib_autotrader.py
 
 ## Automated Daily Execution (macOS cron)
 
-`run_ib_autotrader.sh` is a cron wrapper that fires at 8:00 CT Monday–Friday. Install with:
+The cron wrapper `run_ib_autotrader.sh` lives in the companion infrastructure repo [gmc-infra](https://github.com/KPH3802/gmc-infra) and runs at 8:00 CT Monday-Friday. It sets PATH, rotates the log file, and invokes `python3 ib_autotrader.py --dry-run -v` from this directory.
+
+Runtime path (installed by gmc-infra):
 
 ```bash
-chmod +x run_ib_autotrader.sh
-(crontab -l 2>/dev/null; echo "0 8 * * 1-5 /path/to/ib_execution/run_ib_autotrader.sh") | crontab -
+crontab -l  # shows:  0 8 * * 1-5 /bin/bash /Users/<user>/run_ib_autotrader.sh
 ```
 
-Output is logged to `cron_run.log` (auto-rotates at 500 lines). To go live, remove `--dry-run` from the last line of the script.
+Output is logged to `cron_run.log` in this directory (auto-rotates at 500 lines). To go live, remove `--dry-run` from the invocation line in `gmc-infra/scripts/run_ib_autotrader.sh`, then copy the updated file to `~/run_ib_autotrader.sh`.
+
+**Why the wrapper is external:** The wrapper lived here until Apr 24 2026, but iCloud sync contention with concurrent backup processes caused bash to hit kernel EDEADLK on the wrapper file read, silently killing the cron run. Relocating to a non-iCloud path (`~/`) fixed it. Canonical source is version-controlled in gmc-infra.
 
 **Note:** The IBKR Gateway and browser login must be completed manually before the cron job fires — authentication cannot be automated.
 
@@ -80,12 +83,11 @@ Output is logged to `cron_run.log` (auto-rotates at 500 lines). To go live, remo
 ```
 ib_execution/
   ib_autotrader.py        # Main script
-  run_ib_autotrader.sh    # Cron wrapper for automated daily execution
   config_example.py       # Template — copy to config.py
   config.py               # Your settings (git-ignored)
   trade_log.csv           # Trade log (git-ignored)
   positions.db            # Open position tracker (git-ignored)
-  cron_run.log            # Cron run log (git-ignored)
+  cron_run.log            # Cron run log, written by external wrapper (git-ignored)
   requirements.txt
   README.md
   .gitignore
