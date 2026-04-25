@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
-GMC critical alerts via Pushover (HTTPS API) with SMTP email fallback.
+GMC critical alerts via Pushover (HTTPS API) with parallel + fallback SMTP email.
 
 Public:
     send_pushover(message, priority='high', title='GMC Alert') -> bool
     send_critical_alert(message) -> bool   # emergency-priority wrapper
+    send_alert_email(message, severity_label, fallback_reason=None) -> bool
 
-On Pushover API failure (non-200, status != 1, timeout, exception),
-falls back to a [CRITICAL][GMC] SMTP email to CRITICAL_ALERT_RECIPIENTS
-and logs the [FALLBACK] line per Apr 17 canon.
+On Pushover success for high/emergency priority, a parallel email is also
+sent (subject [HIGH][GMC] or [CRITICAL][GMC]) so a missed phone buzz does
+not mean a missed alert.
+
+On Pushover API failure (non-200, status != 1, timeout, exception), the same
+SMTP function fires with a fallback header noting the primary failure reason,
+and the [FALLBACK] line is logged per Apr 17 canon.
 """
 
 import sys
+import socket
 import logging
 import smtplib
+from datetime import datetime, timezone
 from pathlib import Path
 from email.mime.text import MIMEText
 
@@ -53,7 +60,7 @@ def send_pushover(message: str, priority: str = 'high', title: str = 'GMC Alert'
     if not user_key or not app_token:
         reason = 'missing_credentials'
         logger.error('[FALLBACK] source=pushover primary=https_api primary_error=%s fallback=critical_email', reason)
-        _send_critical_email(message, reason)
+        send_alert_email(message, '[CRITICAL][GMC]', fallback_reason=reason)
         return False
 
     payload = {
@@ -72,23 +79,23 @@ def send_pushover(message: str, priority: str = 'high', title: str = 'GMC Alert'
     except requests.exceptions.Timeout:
         reason = 'timeout'
         logger.error('[FALLBACK] source=pushover primary=https_api primary_error=%s fallback=critical_email', reason)
-        _send_critical_email(message, reason)
+        send_alert_email(message, '[CRITICAL][GMC]', fallback_reason=reason)
         return False
     except requests.exceptions.ConnectionError as e:
         reason = 'connection_error:' + type(e).__name__
         logger.error('[FALLBACK] source=pushover primary=https_api primary_error=%s fallback=critical_email', reason)
-        _send_critical_email(message, reason)
+        send_alert_email(message, '[CRITICAL][GMC]', fallback_reason=reason)
         return False
     except Exception as e:
         reason = 'exception:' + type(e).__name__
         logger.error('[FALLBACK] source=pushover primary=https_api primary_error=%s fallback=critical_email', reason)
-        _send_critical_email(message, reason)
+        send_alert_email(message, '[CRITICAL][GMC]', fallback_reason=reason)
         return False
 
     if resp.status_code != 200:
         reason = 'http_' + str(resp.status_code)
         logger.error('[FALLBACK] source=pushover primary=https_api primary_error=%s fallback=critical_email', reason)
-        _send_critical_email(message, reason)
+        send_alert_email(message, '[CRITICAL][GMC]', fallback_reason=reason)
         return False
 
     try:
@@ -96,17 +103,27 @@ def send_pushover(message: str, priority: str = 'high', title: str = 'GMC Alert'
     except ValueError:
         reason = 'invalid_json'
         logger.error('[FALLBACK] source=pushover primary=https_api primary_error=%s fallback=critical_email', reason)
-        _send_critical_email(message, reason)
+        send_alert_email(message, '[CRITICAL][GMC]', fallback_reason=reason)
         return False
 
     if body.get('status') != 1:
         errors = body.get('errors', [])
         reason = 'status_not_1:' + ','.join(str(e) for e in errors) if errors else 'status_not_1'
         logger.error('[FALLBACK] source=pushover primary=https_api primary_error=%s fallback=critical_email', reason)
-        _send_critical_email(message, reason)
+        send_alert_email(message, '[CRITICAL][GMC]', fallback_reason=reason)
         return False
 
     logger.info('Pushover sent [' + priority + ']: ' + message[:80])
+
+    # Layer B: parallel email for high+ priority. Pushover already delivered,
+    # so any email failure here is non-fatal and must not flip the return value.
+    if priority in ('high', 'emergency'):
+        severity_label = '[CRITICAL][GMC]' if priority == 'emergency' else '[HIGH][GMC]'
+        try:
+            send_alert_email(message, severity_label)
+        except Exception as e:
+            logger.warning('Layer B parallel email failed (Pushover succeeded): ' + repr(e))
+
     return True
 
 
@@ -115,8 +132,14 @@ def send_critical_alert(message: str) -> bool:
     return send_pushover(message, priority='emergency', title='[GMC EMERGENCY]')
 
 
-def _send_critical_email(message: str, fallback_reason: str) -> bool:
-    """SMTP fallback when Pushover API call fails."""
+def send_alert_email(message: str, severity_label: str, fallback_reason: str = None) -> bool:
+    """Send one alert email to CRITICAL_ALERT_RECIPIENTS.
+
+    severity_label: subject prefix, e.g. '[HIGH][GMC]' or '[CRITICAL][GMC]'.
+    fallback_reason: when set, body marks this as the Pushover fallback channel
+        and includes the primary failure reason for diagnosis.
+    Returns True on SMTP success, False on failure (logged, not raised).
+    """
     try:
         sender = config.EMAIL_SENDER
         password = config.EMAIL_PASSWORD
@@ -124,16 +147,22 @@ def _send_critical_email(message: str, fallback_reason: str) -> bool:
         smtp_port = config.SMTP_PORT
         recipients = config.CRITICAL_ALERT_RECIPIENTS
     except AttributeError as e:
-        logger.error('Critical fallback email misconfigured: %s', e)
+        logger.error('Alert email misconfigured: %s', e)
         return False
 
-    subject = '[CRITICAL][GMC] ' + message[:80]
-    body = (
-        'A critical GMC alert could not be delivered via Pushover.\n\n'
-        'Original message:\n' + message + '\n\n'
-        'Pushover failure reason: ' + fallback_reason + '\n\n'
-        'This email is the fallback channel (Apr 17 Fallback Observability canon).\n'
-    )
+    subject = severity_label + ' ' + message[:80]
+    timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    hostname = socket.gethostname()
+    footer = '\n\n---\n' + timestamp + ' on ' + hostname + '\n'
+
+    if fallback_reason:
+        body = (
+            'Pushover delivery failed (' + fallback_reason + ') -- this is the email fallback channel.\n\n'
+            + message
+            + footer
+        )
+    else:
+        body = message + footer
 
     msg = MIMEText(body)
     msg['Subject'] = subject
@@ -145,10 +174,10 @@ def _send_critical_email(message: str, fallback_reason: str) -> bool:
             server.starttls()
             server.login(sender, password)
             server.sendmail(sender, recipients, msg.as_string())
-        logger.info('Critical fallback email sent: ' + subject)
+        logger.info('Alert email sent: ' + subject)
         return True
     except Exception as e:
-        logger.error('Critical fallback email FAILED (%s): %s', type(e).__name__, e)
+        logger.error('Alert email send failed: ' + repr(e))
         return False
 
 
