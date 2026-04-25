@@ -1449,7 +1449,8 @@ def check_and_close_positions(account_id, dry_run, vix):
         elif return_pct <= breaker_val:
             close_reason = "CATASTROPHIC_BREAKER"
             logger.warning(f"  {ticker}: CATASTROPHIC BREAKER triggered ({return_pct:.1f}%)")
-            send_twilio_sms(f"[GMC BREAKER] {ticker} CATASTROPHIC BREAKER: {return_pct:.1f}% return. Position closing.")
+            from pushover_alerts import send_critical_alert
+            send_critical_alert(f"[GMC BREAKER] {ticker} CATASTROPHIC BREAKER: {return_pct:.1f}% return. Position closing.")
 
         if close_reason is None:
             continue
@@ -1564,27 +1565,17 @@ def log_trade(signal, shares, size, status, order_id=None, vix=None):
 
 
 # ---------------------------------------------------------------------------
-# Twilio SMS critical alerts
+# Critical alerts (Pushover backward-compat shim)
 # ---------------------------------------------------------------------------
 def send_twilio_sms(message):
-    """Send SMS via Telnyx REST API. Fails silently if not configured."""
-    api_key = getattr(config, 'TELNYX_API_KEY', '')
-    frm     = getattr(config, 'TELNYX_FROM_NUMBER', '')
-    to      = getattr(config, 'TELNYX_TO_NUMBER', '')
-    if not all([api_key, frm, to]):
-        logger.warning('Telnyx not configured -- SMS skipped')
-        return
-    try:
-        url  = 'https://api.telnyx.com/v2/messages'
-        hdrs = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
-        payload = {'from': frm, 'to': to, 'text': message}
-        resp = requests.post(url, headers=hdrs, json=payload, timeout=10)
-        if resp.status_code == 200:
-            logger.info(f'Telnyx SMS sent: {message[:60]}')
-        else:
-            logger.error(f'Telnyx SMS failed {resp.status_code}: {resp.text[:100]}')
-    except Exception as e:
-        logger.error(f'Telnyx SMS exception: {e}')
+    """Backward-compat shim. Routes to Pushover at high priority.
+
+    Apr 25 2026: replaced Telnyx (MNO_REJECTED). Kept name to avoid
+    churning 5 unchanged call sites; 2 catastrophic call sites moved
+    to send_critical_alert() in the same commit.
+    """
+    from pushover_alerts import send_pushover
+    send_pushover(message, priority='high')
 
 
 # ---------------------------------------------------------------------------
@@ -2256,7 +2247,8 @@ def run(dry_run=False, verbose=False):
     if not dry_run:
         if not check_ib_connection():
             logger.error("Cannot connect to IB Gateway. Aborting.")
-            send_twilio_sms("[GMC ALERT] IB Gateway unreachable. Live orders cannot execute.")
+            from pushover_alerts import send_critical_alert
+            send_critical_alert("[GMC ALERT] IB Gateway unreachable. Live orders cannot execute.")
             send_summary_email([], [], vix, dry_run)
             return
 

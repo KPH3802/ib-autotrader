@@ -44,11 +44,11 @@ FORM4_DB = "../form4_scanner/form4_insider_trades.db"
 TRADE_LOG_PATH = "trade_log.csv"
 POSITIONS_DB = "positions.db"    # Tracks open div cut positions for exit management
 
-# Twilio SMS alerts (critical failure notifications)
-TWILIO_ACCOUNT_SID = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # From Twilio console
-TWILIO_AUTH_TOKEN  = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # From Twilio console
-TWILIO_FROM_NUMBER = "+1XXXXXXXXXX"  # Your Twilio number
-TWILIO_TO_NUMBER   = "+1XXXXXXXXXX"  # Your cell number
+# ---------------------------------------------------------------------------
+# Pushover critical alerts
+# ---------------------------------------------------------------------------
+PUSHOVER_USER_KEY = "uYOUR_USER_KEY_HERE"   # From pushover.net home page
+PUSHOVER_APP_TOKEN = "aYOUR_APP_TOKEN_HERE"  # From your application settings
 
 # ---------------------------------------------------------------------------
 # Path A: Percentage-based position sizing
