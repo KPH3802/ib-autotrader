@@ -51,6 +51,11 @@ PUSHOVER_USER_KEY = "uYOUR_USER_KEY_HERE"   # From pushover.net home page
 PUSHOVER_APP_TOKEN = "aYOUR_APP_TOKEN_HERE"  # From your application settings
 
 # ---------------------------------------------------------------------------
+# Healthchecks.io Layer C heartbeat (out-of-band liveness check)
+# ---------------------------------------------------------------------------
+HEALTHCHECKS_LAYER_C_URL = "https://hc-ping.com/YOUR-UUID-HERE"  # From healthchecks.io check page
+
+# ---------------------------------------------------------------------------
 # Path A: Percentage-based position sizing
 # ---------------------------------------------------------------------------
 SCORE_PCT = {2: 0.03, 3: 0.05, 4: 0.08, 5: 0.08}
