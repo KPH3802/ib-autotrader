@@ -1166,9 +1166,31 @@ def init_positions_db():
             close_price REAL,
             close_reason TEXT,
             return_pct REAL,
+            expected_return_pct REAL,
+            expected_hold_days INTEGER,
+            score INTEGER,
+            spy_entry_price REAL,
+            vs_expected_pct REAL,
+            spy_return_pct REAL,
+            alpha_vs_spy REAL,
             UNIQUE(ticker, entry_date)
         )
     """)
+    # Idempotent migration for existing OLD-schema DBs (Apr 27 2026 fix)
+    _newer_cols = [
+        ('expected_return_pct', 'REAL'),
+        ('expected_hold_days', 'INTEGER'),
+        ('score', 'INTEGER'),
+        ('spy_entry_price', 'REAL'),
+        ('vs_expected_pct', 'REAL'),
+        ('spy_return_pct', 'REAL'),
+        ('alpha_vs_spy', 'REAL'),
+    ]
+    c.execute('PRAGMA table_info(open_positions)')
+    _existing_cols = {row[1] for row in c.fetchall()}
+    for _name, _type in _newer_cols:
+        if _name not in _existing_cols:
+            c.execute(f'ALTER TABLE open_positions ADD COLUMN {_name} {_type}')
     # Signal benchmarks lookup (backtest expected returns)
     c.execute("""
         CREATE TABLE IF NOT EXISTS signal_benchmarks (
