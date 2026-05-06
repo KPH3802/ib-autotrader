@@ -2080,7 +2080,7 @@ WATCHDOG_SCANNERS = [
     },
     {
         "name":             "Dividend Initiation Scanner",
-        "subject_fragment": "Dividend Scanner",
+        "subject_fragment": "DIV INITIATION",
         "max_silence_days": 3,
     },
 ]
