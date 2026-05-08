@@ -1146,6 +1146,44 @@ def place_order(account_id, conid, side, quantity):
 # Positions database — Dividend Cut tracker
 # ---------------------------------------------------------------------------
 
+def validate_benchmark_coverage():
+    """Compare SIGNAL_METADATA dict (in-code) against signal_benchmarks DB rows.
+
+    Logs warnings for mismatches. A source present in SIGNAL_METADATA but missing
+    from signal_benchmarks DB means the signal will fire with placeholder values
+    rather than a measured backtest.
+
+    Origin: 2026-05-08 F4_SELL discovery. F4_SELL_S1/S2 were deployed with 0.60
+    placeholder values in SIGNAL_METADATA but had no signal_benchmarks DB rows;
+    the autotrader fired them anyway with no validation. This gate prevents the
+    next instance.
+
+    Current behavior: WARN only (logs [BENCHMARK GAP]).
+    Future enhancement (post-go-live, after F4 backtest decisions): promote to
+    fail-fast (sys.exit(1)) so live trading cannot proceed with placeholder values.
+    """
+    conn = sqlite3.connect(str(POSITIONS_DB))
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT source FROM signal_benchmarks")
+    db_sources = {row[0] for row in c.fetchall()}
+    conn.close()
+    code_sources = set(SIGNAL_METADATA.keys())
+
+    missing_in_db = code_sources - db_sources
+    missing_in_code = db_sources - code_sources
+
+    if missing_in_db:
+        logger.warning("[BENCHMARK GAP] SIGNAL_METADATA sources missing from signal_benchmarks DB: %s", sorted(missing_in_db))
+        logger.warning("[BENCHMARK GAP] These signals fire with in-code placeholder values, NOT measured backtests.")
+        logger.warning("[BENCHMARK GAP] Run a backtest and INSERT signal_benchmarks rows before treating as alpha-bearing.")
+    if missing_in_code:
+        logger.warning("[BENCHMARK ORPHAN] signal_benchmarks DB rows missing from SIGNAL_METADATA: %s", sorted(missing_in_code))
+    if not missing_in_db and not missing_in_code:
+        logger.info("[BENCHMARK OK] All %d SIGNAL_METADATA sources have signal_benchmarks rows.", len(code_sources))
+
+    return missing_in_db, missing_in_code
+
+
 def init_positions_db():
     """Create positions.db with open_positions table if it doesn't exist."""
     conn = sqlite3.connect(str(POSITIONS_DB))
@@ -2248,6 +2286,9 @@ def run(dry_run=False, verbose=False):
 
     # Step 1: Init positions DB
     init_positions_db()
+
+    # Step 1b: Validate benchmark coverage (warn on placeholder/missing rows -- lesson_2026-05-08)
+    validate_benchmark_coverage()
 
     # Step 1b: Scanner watchdog -- PA health check
     check_scanner_watchdog()
