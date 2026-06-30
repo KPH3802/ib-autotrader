@@ -2085,41 +2085,21 @@ def send_summary_email(signals_executed, signals_skipped, vix, dry_run=False,
 # Scanner watchdog -- PA health check
 # ---------------------------------------------------------------------------
 
+# 2026-06-30 — Gmail-heartbeat watchdog trimmed to graduated strategies
+# only (alert-only path: fires Twilio SMS + system_warnings summary; gates
+# no trading). PA account KPH3802 downgraded 2026-06-21 (payment failure,
+# NOT deliberate); 20 of 21 PA scanner tasks force-disabled by free tier.
+# PM restoring account to re-enable PEAD_BULL task only. Removed Form4, 8-K,
+# SI, COT, CEL, Dividend Initiation entries — their strategies are REJECTED
+# or weak/suspended per Step 5. 8-K (8K_1.01) is DEFERRED, not dropped:
+# never v2-backtested, status unclear — re-add here once investigated.
+# To restore a scanner: re-add dict here AND re-enable the PA task.
+# See gmc_engine STATUS.md 2026-06-30 entry.
 WATCHDOG_SCANNERS = [
-    {
-        "name":             "Form4 Scanner",
-        "subject_fragment": "Form 4 Scanner Status",
-        "max_silence_days": 5,
-    },
-    {
-        "name":             "8-K Scanner",
-        "subject_fragment": "8-K",
-        "max_silence_days": 7,
-    },
     {
         "name":             "PEAD Scanner",
         "subject_fragment": "PEAD",
         "max_silence_days": 14,
-    },
-    {
-        "name":             "SI Scanner",
-        "subject_fragment": "SI SQUEEZE:",
-        "max_silence_days": 16,
-    },
-    {
-        "name":             "COT Scanner",
-        "subject_fragment": "COT",
-        "max_silence_days": 10,
-    },
-    {
-        "name":             "CEL Scanner",
-        "subject_fragment": "CEL BEAR:",
-        "max_silence_days": 30,
-    },
-    {
-        "name":             "Dividend Initiation Scanner",
-        "subject_fragment": "DIV INITIATION",
-        "max_silence_days": 3,
     },
 ]
 
