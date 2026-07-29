@@ -118,6 +118,49 @@ COT_BREAKER    = -39.9    # Catastrophic circuit breaker (% return)
 IMAP_SERVER = "imap.gmail.com"
 IMAP_PORT = 993
 
+# Sender allowlist for signal-email selection (added 2026-07-29).
+#
+# WHY: every IMAP search below selected on SUBJECT + SINCE with NO sender filter,
+# on the whole INBOX. Two consequences once general mail is forwarded into this
+# mailbox (the GMC-EMAIL wiring):
+#   1. CROWD-OUT. SEARCH returns ascending sequence order and the signal readers
+#      take the TAIL (msg_ids[-3:] / [-2:]) — the most recently arrived matches.
+#      A forwarded mail matching a loose fragment and arriving after the scanner's
+#      mail consumes those slots, so the real signal is never fetched. It looks
+#      exactly like "no signals today". "COT" is a 3-char substring (Scott,
+#      cotton, boycott, mascot, apricot) with only 2 slots; "PEAD" has 3.
+#   2. WATCHDOG BLINDNESS. check_scanner_watchdog() only asks whether ANYTHING
+#      matched "PEAD" — no second guard — so one forwarded mail with that string
+#      in its subject suppresses a real 14-day scanner-silence alert.
+# Signal INJECTION was never possible: each reader re-checks the strict
+# "<NAME> BULL:/BEAR:" form before parsing. This closes loss and blindness, not
+# injection.
+#
+# The scanners (pead/cot/si/... on PythonAnywhere) send via config.EMAIL_SENDER
+# in THEIR config, which is this same Gmail account — i.e. the mailbox receives
+# signal mail addressed from itself. It is NOT ib_execution's own config.EMAIL_SENDER,
+# which is the separate outbound alert address on another domain; filtering on that
+# would have discarded every real signal.
+SIGNAL_SENDER = getattr(config, "IMAP_USER", "")
+
+
+def _signal_from_clause():
+    """IMAP FROM term restricting a signal search to the scanner sender.
+
+    Returns "" when no sender is configured, which preserves today's unfiltered
+    behaviour rather than silently matching nothing — a filter that quietly
+    selected zero mail would read as a quiet market and stop all trading with no
+    error. The gap is made loud via system_warnings instead.
+    """
+    if not SIGNAL_SENDER:
+        msg = ("WARNING: SIGNAL_SENDER unset -- signal emails are selected by "
+               "subject only; forwarded mail can crowd out scanner mail")
+        if msg not in system_warnings:
+            system_warnings.append(msg)
+        logger.warning(msg)
+        return ""
+    return 'FROM "%s" ' % SIGNAL_SENDER
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -284,14 +327,14 @@ def query_8k_signals_from_email(today_str):
         imap_date = dt.strftime("%d-%b-%Y")
 
         typ, data = mail.search(None,
-            f'(SUBJECT "8-K SHORT:" SINCE "{imap_date}")')
+            f'({_signal_from_clause()}SUBJECT "8-K SHORT:" SINCE "{imap_date}")')
         msg_ids = data[0].split() if data[0] else []
 
         if not msg_ids:
             logger.info("No 8-K SHORT email today — checking last 4 days")
             four_days_ago = (dt - timedelta(days=4)).strftime("%d-%b-%Y")
             typ, data = mail.search(None,
-                f'(SUBJECT "8-K SHORT:" SINCE "{four_days_ago}")')
+                f'({_signal_from_clause()}SUBJECT "8-K SHORT:" SINCE "{four_days_ago}")')
             msg_ids = data[0].split() if data[0] else []
 
         if not msg_ids:
@@ -452,7 +495,7 @@ def query_div_cut_signals(today_str):
         since_date = (dt - timedelta(days=DIV_CUT_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
 
         typ, data = mail.search(None,
-            f'(SUBJECT "Dividend Cut ALERT" SINCE "{since_date}")')
+            f'({_signal_from_clause()}SUBJECT "Dividend Cut ALERT" SINCE "{since_date}")')
         msg_ids = data[0].split() if data[0] else []
 
         if not msg_ids:
@@ -547,7 +590,7 @@ def query_pead_signals_from_email(today_str):
         mail.select('INBOX')
         dt = datetime.strptime(today_str, '%Y-%m-%d')
         since_date = (dt - timedelta(days=PEAD_LOOKBACK_DAYS)).strftime('%d-%b-%Y')
-        typ, data = mail.search(None, f'(SUBJECT "PEAD" SINCE "{since_date}")')
+        typ, data = mail.search(None, f'({_signal_from_clause()}SUBJECT "PEAD" SINCE "{since_date}")')
         msg_ids = data[0].split() if data[0] else []
         if not msg_ids:
             logger.info('No PEAD emails in lookback window')
@@ -601,7 +644,7 @@ def query_si_squeeze_signals_from_email(today_str):
         mail.select('INBOX')
         dt = datetime.strptime(today_str, '%Y-%m-%d')
         since_date = (dt - timedelta(days=3)).strftime('%d-%b-%Y')
-        typ, data = mail.search(None, f'(SUBJECT "SI SQUEEZE:" SINCE "{since_date}")')
+        typ, data = mail.search(None, f'({_signal_from_clause()}SUBJECT "SI SQUEEZE:" SINCE "{since_date}")')
         msg_ids = data[0].split() if data[0] else []
         if not msg_ids:
             logger.info('No SI SQUEEZE emails in lookback window')
@@ -659,7 +702,7 @@ def query_cot_signals_from_email(today_str):
         mail.select('INBOX')
         dt = datetime.strptime(today_str, '%Y-%m-%d')
         since_date = (dt - timedelta(days=7)).strftime('%d-%b-%Y')
-        typ, data = mail.search(None, f'(SUBJECT "COT" SINCE "{since_date}")')
+        typ, data = mail.search(None, f'({_signal_from_clause()}SUBJECT "COT" SINCE "{since_date}")')
         msg_ids = data[0].split() if data[0] else []
         if not msg_ids:
             logger.info('No COT emails in lookback window')
@@ -734,7 +777,7 @@ def query_cel_signals_from_email(today_str):
         mail.select('INBOX')
         dt = datetime.strptime(today_str, '%Y-%m-%d')
         since_date = (dt - timedelta(days=2)).strftime('%d-%b-%Y')
-        typ, data = mail.search(None, f'(SUBJECT "CEL BEAR:" SINCE "{since_date}")')
+        typ, data = mail.search(None, f'({_signal_from_clause()}SUBJECT "CEL BEAR:" SINCE "{since_date}")')
         msg_ids = data[0].split() if data[0] else []
         if not msg_ids:
             logger.info('No CEL BEAR emails in lookback window')
@@ -781,7 +824,7 @@ def query_13f_signals_from_email(today_str):
         mail.select('INBOX')
         dt = datetime.strptime(today_str, '%Y-%m-%d')
         since_date = (dt - timedelta(days=THIRTEENF_LOOKBACK_DAYS)).strftime('%d-%b-%Y')
-        typ, data = mail.search(None, '(SUBJECT "13F BULL:" SINCE "' + since_date + '")') 
+        typ, data = mail.search(None, '(' + _signal_from_clause() + 'SUBJECT "13F BULL:" SINCE "' + since_date + '")') 
         msg_ids = data[0].split() if data[0] else []
         if not msg_ids:
             logger.info('No 13F BULL emails in lookback window')
@@ -2119,7 +2162,8 @@ def check_scanner_watchdog():
             max_days = scanner["max_silence_days"]
             lookback = max_days + 1
             since_str = (today - timedelta(days=lookback)).strftime("%d-%b-%Y")
-            q = "(SUBJECT " + chr(34) + fragment + chr(34) + " SINCE " + chr(34) + since_str + chr(34) + ")"
+            q = ("(" + _signal_from_clause() + "SUBJECT " + chr(34) + fragment + chr(34)
+                 + " SINCE " + chr(34) + since_str + chr(34) + ")")
             typ, data = mail.search(None, q)
             msg_ids = data[0].split() if data[0] else []
             if not msg_ids:
